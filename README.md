@@ -20,4 +20,6 @@ Default sources are BRREG's open entity and roles APIs, its public latest-year a
 
 ## Submission readiness
 
-The exact Builderr downloadable evaluation contract could not be fetched in this network-restricted environment. Check this JSONL envelope against that contract before submitting. The required live 100-company report also remains to be run with the actual supplied batch and network access. Add the submitter's contact details when sending the entry. The README and engineering report do not claim an official score or qualification.
+The current Builderr page lists score weights of 50 recall/coverage, 30 precision/evidence, 12 synthesis and 8 UX, with qualification at 65/100 on an official run. The downloadable evaluation contract could not be fetched in this environment, and the required live 100-company report still needs to be run with Builderr's actual batch and network access. Add the submitter's contact details before entry. Offline tests are not a competition score or qualification.
+
+See [ENGINEERING_REPORT.md](ENGINEERING_REPORT.md) for implementation and test details, and [PROJECT_COMPLETION_REPORT.md](PROJECT_COMPLETION_REPORT.md) for the project history, current readiness and prioritized next steps.
