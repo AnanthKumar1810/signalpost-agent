@@ -1,77 +1,102 @@
-# Signalpost agent: implementation and verification report
+# Signalpost project completion report
 
-Prepared 17 October 2026. This report distinguishes fixture results from live service results. It does not claim an official Builderr score or qualification.
+Prepared 17 October 2026 (Asia/Kolkata)
 
-## Current status
+Repository: https://github.com/AnanthKumar1810/signalpost-agent  
+Verified implementation commit: dcf649deabd41d5f8e0f56d5304e9a2fbbdcdf06  
+Status: implementation completed, pushed, and verified in GitHub. Competition performance and qualification remain unverified.
 
-The repository is now a more complete, reproducible baseline. It validates Norwegian organisation numbers, anchors identity in BRREG, collects roles and available registry facts, retrieves public annual-account key figures, conservatively checks a BRREG-declared company website, attaches dated source evidence, keeps content-addressed source history, produces deterministic summaries, and returns one terminal envelope for every company input. All seven claim families get exactly one terminal status per result.
+## What is complete
 
-It is not possible to certify full submission readiness in this environment. The official evaluation contract is linked from Builderr’s page as Markdown, but the browser fetch and shell network are blocked for that file. The live BRREG and Builderr hosts also fail DNS resolution here. Thus the real 100-company smoke run, clean-network dependency check, and evaluator-schema validation remain outstanding. The output contract below follows the visible official rules and needs a final field-by-field check against Builderr’s downloadable contract.
+The repository contains a reproducible Python baseline for researching Norwegian companies from their organisation numbers. It anchors identity in Norway's official Brønnøysund Register (BRREG), collects registry facts and roles, retrieves BRREG's public annual-account key figures where available, and optionally checks one company website only if BRREG lists it. It emits structured, evidence-linked results, captures source dates and reporting periods where available, stores source snapshots in SQLite, detects changes across runs, and generates a deterministic summary and local HTML viewer.
 
-## Competition requirements checked
+The project files were committed to the repository's main branch. The repo root now contains .gitignore, ENGINEERING_REPORT.md, README.md, signalpost_agent.py, smoke.json and test_signalpost_agent.py. The repository itself and its history were retained; the project files replaced the prior working tree contents. The current repository is public.
 
-Builderr’s current page says the agent must accept the company batch supplied at run time, return one complete result per company, keep claims tied to the right entity with sources and dates, preserve evidence across idempotent refreshes, and finish within the evaluator’s time and resource limits. Submission calls for a 100-company smoke-test report, repository link, exact commit, one run command, model/API/licence details, expected run cost, and contact details. Qualification requires at least 65/100 on an official run. The current score weights are 50 recall and coverage, 30 precision and evidence, 12 synthesis, and 8 UX. These facts are from the [current Signalpost challenge page](https://builderr.ai/challenges/signalpost), read 17 October 2026.
+This completes the implementation baseline. It does not yet establish that Builderr's evaluator accepts the output, that live results meet the official score threshold, or that the project qualifies. The exact evaluator contract and required live benchmark still need to be run.
 
-The published technical rules require exactly one terminal envelope per input and distinct `available`, `not_available`, `blocked`, `not_applicable`, `ambiguous`, and `failed` statuses. The implementation uses all six status values and applies one status to each of its seven families. Its envelope includes the input organisation number, identity anchor, claims and facts, evidence, source snapshots, errors, changes, a deterministic summary, run metadata, and request/cost metadata. The official downloadable contract could not be inspected, so compatibility with any additional required field names has not been verified.
+## How the architecture was selected
 
-## Implementation choices
+The original request was to study and test five related projects separately, learn from them, integrate their useful techniques, and report what was learned. We reviewed Fire Enrich, Company Research Agent, FORGE/Dataforge, python-brreg and Crawl4AI as architecture references. We did not clone or execute those five upstream systems; dependencies, service credentials and live network access were not available. No third-party result is claimed as a test of this project.
 
-The system uses only Python’s standard library. There are no dependency pins to drift and no model or paid search credentials. The primary identity source is the official BRREG entity endpoint; public roles come from its roles endpoint. Financial figures use the separate BRREG public key-figures API, which can return the latest approved accounts for entities that follow ordinary accounting presentation; its upstream specification warns that this service is a preview without service guarantees and coverage excludes some industries and consolidated figures. Values are published only when the returned statement’s organisation number matches the requested number. Facts include the retrieval date and reporting period when available. [BRREG dataset licence](https://www.brreg.no/en/use-of-data-from-the-bronnoysund-register-centre/datasets-and-api/) · [BRREG key-figures API specification](https://raw.githubusercontent.com/brreg/regnskapsregister-api/main/src/main/resources/specification/regnskapsregister.json)
-
-Company-site requests are limited to the exact HTTPS host listed by BRREG. The fetch checks `robots.txt`, resolves public IP addresses, rejects unsafe redirects, bounds response size, and requires the legal name or organisation number on the page before publishing descriptive facts. A careers link is not counted as an active job. The system does not yet discover or verify active vacancies, parse annual-account PDFs, or collect dated company activity. It marks these areas unavailable rather than guessing. Public website terms apply. No social platform is scraped.
-
-The deterministic summary uses only evidence-backed registry fields and identifies unknown claim families. Hash-addressed snapshots and a current-source pointer prevent duplicate snapshots and false changes on identical refreshes; changes retain the earlier hash and identify changed fields. Every input receives a complete envelope when a per-company exception occurs.
-
-## Reference project decisions
-
-This remains an architecture audit and adapted-component test. The five upstream projects were not cloned or executed: service credentials, external network and/or additional frameworks were not available. No upstream test result is claimed.
-
-| Reference | Relevant design | Decision and evidence here |
+| Reference | Useful idea | Decision |
 |---|---|---|
-| [Fire Enrich](https://github.com/firecrawl/fire-enrich) | Specialized company research modules using Firecrawl and an LLM, with source attribution. | Adopted typed fact groups and evidence references. Excluded email/domain-first identity and per-company paid multi-agent discovery because legal-entity proof and reproducible cost matter more. No upstream run; no provider keys. |
-| [Company Research Agent](https://github.com/guy-hartstein/company-research-agent) | Analyzer → collector → curator → briefing → editor graph with Tavily and a selectable model. | Adapted separation into identity → register facts/roles → financials → optional site → summary. Excluded full graph orchestration to keep the batch deterministic and dependency-light. No upstream run; no provider keys. |
-| [FORGE / Dataforge](https://github.com/Nuclear-Marmalade/dataforge) | Deterministic collection, optional local AI, checkpoints, database persistence, and recovery. | Adapted immutable snapshots, per-company error containment, and explicit refresh changes. Replaced fill-empty-only updates with content versions. No upstream run; its database and setup were outside this baseline. |
-| [python-brreg](https://github.com/crdbrd/python-brreg) | Python wrapper for entity and role lookup by Norwegian organisation number. | Implemented a small standard-library adapter against official BRREG APIs so the legal key stays central and no additional package is required. No upstream installation or live API run; DNS blocked. |
-| [Crawl4AI](https://github.com/unclecode/crawl4ai) | Async/browser crawling with deterministic extractors and optional typed LLM output. | Adapted bounded static-page parsing and deterministic extraction. Excluded browser setup and deep crawling until an evaluation shows this lane increases supported recall enough to justify its runtime and failure surface. No upstream run; browser install/network unavailable. |
+| Fire Enrich | Specialized fact groups, source attribution, crawling plus extraction | Adapt typed claim families and evidence references. Exclude email/domain-first identity and paid multi-agent research for every company. |
+| Company Research Agent | Separate analysis, collection, curation and briefing steps | Use a smaller deterministic pipeline: identify, collect registry/financial/site evidence, curate, summarize. Exclude a full LangGraph/Tavily workflow per company to control cost and latency. |
+| FORGE / Dataforge | Deterministic extraction, checkpoints, recovery, persistence | Adapt per-company error containment and versioned source snapshots. Prefer explicit content-change detection over fill-empty-only updates. |
+| python-brreg | Norwegian company and role lookup by organisation number | Keep BRREG and the legal number as the identity anchor, but use a small standard-library client instead of adding a wrapper dependency. |
+| Crawl4AI | Structured crawl and extraction | Use one bounded static page and deterministic parsing. Exclude browser installation and deep crawling until measured recall justifies their extra cost and failure surface. |
 
-The combined lesson is that the projects serve separate layers. A minimal version of each useful idea makes the system simpler and more auditable than bringing five overlapping runtimes into one batch process. The current design prioritizes legal identity and evidence accuracy. That choice limits recall until permitted evidence lanes for jobs and public activity are added and measured.
+The combined design keeps the best relevant ideas while using one standard-library runtime. The key tradeoff is deliberate: publish fewer facts rather than risk attaching another entity's facts to the requested company.
 
-## Test commands and measured results
+## Implementation details
 
-Run the local suite with:
+The command accepts a JSON array, one JSON object with organisation_number, JSONL objects, or one number per text line. It validates the Norwegian organisation number before making requests. The documented command is:
 
-```text
-python -m unittest -v
-```
+    python signalpost_agent.py --input smoke.json --output outputs/smoke.jsonl --state outputs/state.sqlite3 --timeout 3
 
-Result on Python 3.13 from a clean-copy checkout: **10 tests passed in 1.789 seconds**. The tests cover organisation-number rejection before network access, registry field/evidence mapping, financial value extraction, rejection of a financial record for another entity, exact website identity gating, private-address rejection, snapshot idempotency and change detection, safe dashboard generation, and a 100-company fixture batch returning one complete result per input.
+For an official run, replace smoke.json with Builderr's supplied batch. The command writes one JSONL envelope per input, a machine-readable run report and an HTML profile browser. SQLite holds content-addressed snapshots and current pointers. Python 3.10+ standard library is the only dependency; there is no model key or paid search API.
 
-The 100-company test is fully mocked. It measures batch envelope behavior, not live recall, source uptime, or live-company accuracy. Its organization numbers are generated valid-format fixtures, not claimed to be 100 real eligible companies.
+BRREG is the identity source. Entity details and registered roles are retrieved from its official APIs. Financial key figures use BRREG's separate public annual-account API and are only accepted when the returned organisation number matches the requested company. This key-figures service is a preview API; availability and coverage are limited.
 
-The live command used on the five-company sample was:
+Website retrieval is limited to the HTTPS hostname explicitly registered by BRREG. The code checks robots.txt, resolves public IP addresses, rejects unsafe redirects, bounds the response and publishes descriptive facts only if the page contains the exact legal name or the organisation number. A careers link is not treated as proof of an active job.
 
-```text
-python signalpost_agent.py --input smoke.json --output outputs/clean-check.jsonl --state outputs/clean-check.sqlite3 --timeout 1
-```
+Each result includes the requested identity, claims/statuses, evidence references, retrieval dates and reporting periods where available, source snapshots, errors, change details and run/request/cost metadata. Seven claim families each get one terminal status: available, not_available, blocked, not_applicable, ambiguous or failed. Per-company errors are contained so one lookup failure does not silently drop the rest of the batch. A deterministic summary uses supported registry facts and lists unknown families. Identical snapshots do not create false changes; changed snapshots retain history and list changed fields.
 
-Measured result from a clean-copy checkout: 5 inputs, 5 terminal outputs, 5 failed identity lookups, 5 recorded requests, 5 errors, 206 ms aggregate request time, and $0.00 paid API cost. The errors were caused by unavailable DNS resolution for BRREG in this execution environment. This confirms complete failure reporting only; it does not verify any live fact or satisfy the required live 100-company smoke report.
+The baseline does not discover or verify current job postings, parse account PDFs, gather dated news or activity, crawl beyond the one declared page, use general web search, or scrape social platforms. It has no LLM stage. These lanes were excluded because the evaluation contract, permitted source conditions, service credentials and live resource budget had not been verified; an unmeasured complex collector could add unsupported matches and reduce reproducibility.
 
-The reproducible command for a supplied batch is:
+## Verification performed
 
-```text
-python signalpost_agent.py --input <builderr-batch.jsonl> --output outputs/run.jsonl --state outputs/state.sqlite3 --timeout 3
-```
+The current local test run on 17 October 2026:
 
-The output path creates a JSONL file, machine-readable run report, and local HTML viewer. The implementation has no paid third-party API calls, so expected API cost is **$0 per run**. Compute and wall-clock time are environment-dependent; live 100-company runtime is unknown. Set `SIGNALPOST_CONTACT` to a valid contact before running or submitting.
+    python -m unittest -v
+    Ran 10 tests in 2.417s
+    OK
 
-## Remaining submission blockers
+The suite covers invalid-number rejection before network, BRREG field/evidence mapping, finance extraction and cross-entity rejection, exact website identity checks, private-address rejection, ambiguous/mismatched sites, repeat-run idempotency, change detection, safe HTML escaping, and a mocked 100-input batch with one complete terminal envelope per input.
 
-1. Run the exact command on Builderr’s real 100-company smoke batch with network access. Confirm 100 complete outputs, runtime, errors, API requests, and zero silent drops.
-2. Compare this envelope against the downloadable evaluation contract and adjust any required keys or input format.
-3. Test the pinned commit from a clean clone with the real supplied input and evaluator time budget.
-4. Add the submitter’s contact details. The GitHub repository is private, so provide evaluator access or make it public before sending the entry.
-5. Add permitted, measured evidence lanes for financial statement history, verified active jobs, and dated company activity if they improve recall without material wrong-company matches.
+The mocked 100-company test proves envelope and batch-handling behavior under fixtures; it does not measure live-company coverage, accuracy, uptime or competition score. An earlier live smoke attempt with five sample numbers returned five terminal failure envelopes because DNS resolution for BRREG was unavailable in this environment. It recorded five requests and 206 ms aggregate request time; paid API cost was $0.00. This validates failure reporting, not company data, and is not the required live 100-company run.
 
-The GitHub repository created earlier remains at its previous commit (`fe9b86efd2a8f1bc7b37597fbfa08b4fba694f35`). The connected GitHub integration returned 404 for this private repository on read and write requests, so the verified revision in this package was not pushed. The repository must remain private unless its owner chooses otherwise; no visibility change was made.
+Paid third-party API/model cost is $0 per run in this implementation. Live 100-company compute and wall time have not been measured. If a model/search lane is added, measure and declare its cost and run time under the evaluator limits.
 
-Do not claim a 65/100 score until Builderr reports it from an official run.
+## Current competition fit
+
+The live official Builderr page, checked 17 October 2026, states weights of 50 recall/coverage, 30 precision/evidence, 12 synthesis and 8 UX. A previous listing excerpt in the conversation showed 35/30/20/10/5; use the currently published Builderr page for the current rubric. Qualification is at least 65/100 on an official run, with no separate category thresholds.
+
+Builderr asks for a 100-company smoke-test result or report, repository URL, exact commit, one run command, model/API/licence details, expected official-run cost and contact details. The live page says testing at 1,000+ profiles is allowed, but precomputed profiles and a submitted company manifest are not required: Builderr supplies fresh company batches. Every official input must yield one result within the time/resource budget. The live page lists the challenge close as 21 October 2026. The earlier Unstop excerpt in the conversation had a 17 October project-link deadline and separate email instructions; verify the entry channel and applicable deadline before submission.
+
+The downloadable evaluation contract at https://builderr.ai/docs/signalpost-evaluation-harness.md is linked by the official page but could not be fetched here because the browser fetch route rejects its Markdown content type. The starter brief and permitted-source Markdown links failed for the same reason. Exact envelope field compatibility, full evaluator behavior and permitted-source interpretation therefore remain unverified. The live leaderboard page reviewed 17 October showed 43 scored submissions and zero qualified at that point; that is context, not this project's score.
+
+| Requirement | State | Evidence |
+|---|---|---|
+| Accept a supplied company number and reject malformed input | Implemented | CLI and offline tests |
+| Exact company identity and evidence links | Implemented conservatively | BRREG anchor, financial number check, website name/number gate |
+| Preserve refresh history and detect changes | Implemented | SQLite snapshot tests |
+| Return one result per input | Fixture-verified | Mocked 100-company batch; live batch not run |
+| Official 100-company report | Outstanding | Only five live attempts; DNS unavailable |
+| Exact evaluator schema | Unverified | Contract unavailable to this environment |
+| 1,000 precomputed profiles | Not required by the current page | Builderr supplies official batches |
+| Official score and qualification | Unknown | No official evaluation |
+| Contact information | Outstanding | Must be supplied by project owner before entry |
+
+## GitHub update and correction
+
+The GitHub API integration could read the repository but rejected file writes with HTTP 403. The workspace's shell also could not resolve github.com, and there was no authenticated Git CLI. The project was therefore uploaded through the authenticated GitHub browser UI. The resulting commit is dcf649deabd41d5f8e0f56d5304e9a2fbbdcdf06, titled “Replace repository files with completed Signalpost project.” GitHub's main branch listing and the uploaded README, agent and report were checked after the commit.
+
+An earlier version of ENGINEERING_REPORT.md uploaded with the source still says that the repository remained private and that the revised version was not pushed. That became false after the upload. This completion report corrects the current state: the repository is public and the implementation is pushed. The previous Git history was not deleted.
+
+## Next steps, in order
+
+1. Obtain the exact evaluation contract and real 100-company smoke input from Builderr. Verify fields, input format, permitted sources, time/resource limits and evaluator launch environment.
+2. Clone the exact pinned commit to a clean machine with working network and run the documented command against the actual 100 companies.
+3. Record the input/batch identifier, commit hash, command, output count, run time, errors, requests, source families, cost and representative entity/evidence review. Confirm one terminal envelope per input and zero dropped rows.
+4. Fix schema or live reliability failures before adding more sources. Add contact and confirm whether the Unstop deadline, Builderr cutoff or both apply. Prepare the exact repository link, commit, run command, source/API/licence and cost details.
+5. Once baseline behavior is measured, test permitted job and dated-activity sources in controlled comparisons. Add LLM extraction only if it increases supported recall without increasing wrong-company publication or exceeding budget.
+6. Submit a pinned commit and real smoke report. Claim qualification only after Builderr supplies an official score.
+
+## Sources
+
+- Builderr challenge, requirements and current rubric: https://builderr.ai/challenges/signalpost
+- Builderr evaluation contract (linked, retrieval blocked): https://builderr.ai/docs/signalpost-evaluation-harness.md
+- BRREG data/API licence: https://www.brreg.no/en/use-of-data-from-the-bronnoysund-register-centre/datasets-and-api/
+- BRREG annual-account key-figures API specification: https://raw.githubusercontent.com/brreg/regnskapsregister-api/main/src/main/resources/specification/regnskapsregister.json
+- Project repository: https://github.com/AnanthKumar1810/signalpost-agent
