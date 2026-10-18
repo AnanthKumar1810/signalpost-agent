@@ -30,17 +30,21 @@ class ActivityFeedTests(unittest.TestCase):
         feed = b'<rss><channel><item><title>Example AS opens a new office</title><link>https://example.no/news/office</link><pubDate>Sat, 17 Oct 2026 10:00:00 GMT</pubDate></item></channel></rss>'
         responses = [Response(b"User-agent: *\nAllow: /", "text/plain"), Response(homepage, "text/html"), Response(feed, "application/rss+xml")]
         with patch.object(sp, "public_host", return_value=True), patch.object(sp, "open_safe", side_effect=responses):
-            env = {"operations": {"requests": 0}, "errors": [], "source_snapshots": [], "evidence": [], "changes": []}
-            claims = []
+            env = {"organisation_number": "923609016", "identity_anchor": {"organisation_number": "923609016", "legal_name": "Example AS", "status": "verified"},
+                   "claims": [], "operations": {"requests": 0, "runtime_ms": 0, "third_party_cost_usd": 0.0},
+                   "run": {"started_at": "2026-10-18T00:00:00Z"}, "errors": [], "source_snapshots": [], "evidence": [], "changes": []}
             agent = sp.Agent.__new__(sp.Agent)
             agent.timeout = 1
-            agent.snapshot = lambda org, family, url, raw, payload: {"id": f"snap-{len(env['source_snapshots'])}", "source_id": f"snap-{len(env['source_snapshots'])}", "family": family, "url": url, "retrieved_at": "2026-10-18T00:00:00Z", "changed": False}
-            agent.website("923609016", "https://example.no", "Example AS", env, lambda *a, **k: claims.append(a))
-        activity = next(row for row in claims if row[0] == "public_activity")
-        self.assertEqual(activity[1], "available")
-        self.assertEqual(activity[2][0]["value"]["published_at"], "2026-10-17")
-        self.assertEqual(activity[2][0]["source_url"], "https://example.no/news/office")
-        self.assertTrue(activity[2][0]["evidence_ids"])
+            agent.snapshot = lambda org, family, url, raw, payload: {"id": f"snap-{len(env['source_snapshots'])}", "source_id": f"snap-{len(env['source_snapshots'])}", "family": family, "organisation_number": org, "url": url, "retrieved_at": "2026-10-18T00:00:00Z", "changed": False}
+            agent.website("923609016", "https://example.no", "Example AS", env, lambda family, status, facts=None, reason=None: env["claims"].append({"family": family, "status": status, "facts": facts or [], **({"reason": reason} if reason else {})}))
+            result = agent.finish(env, 0)
+        activity = next(row for row in result["claims"] if row["family"] == "public_activity")
+        self.assertEqual(activity["status"], "available", result["errors"])
+        self.assertEqual(activity["facts"][0]["value"]["published_at"], "2026-10-17")
+        self.assertEqual(activity["facts"][0]["value"]["article_url"], "https://example.no/news/office")
+        self.assertEqual(activity["facts"][0]["source_url"], "https://example.no/feed.xml")
+        self.assertTrue(activity["facts"][0]["evidence_ids"])
+        self.assertFalse(any(error["type"] == "evidence_integrity" for error in result["errors"]))
 
 
 if __name__ == "__main__":

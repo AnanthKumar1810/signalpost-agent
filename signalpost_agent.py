@@ -638,6 +638,7 @@ class Agent:
                     feed_snap = self.snapshot(org, "public_activity", feed_url, feed_body, {"feed": "company-advertised RSS/Atom", "items": len(root)})
                     env["source_snapshots"].append(feed_snap)
                     entries = [node for node in root.iter() if node.tag.rsplit("}", 1)[-1].lower() in {"item", "entry"}]
+                    feed_excerpts = []
                     for entry in entries[:10]:
                         parts = {node.tag.rsplit("}", 1)[-1].lower(): node for node in entry}
                         title = " ".join((parts.get("title").itertext() if parts.get("title") is not None else []))
@@ -666,10 +667,10 @@ class Agent:
                         item_parsed = urllib.parse.urlparse(item_url)
                         if item_parsed.scheme != "https" or item_parsed.hostname != parsed.hostname:
                             continue
-                        item_snap = self.snapshot(org, "public_activity", feed_url, feed_body, {"title": title, "published_at": published, "item_url": item_url})
-                        env["source_snapshots"].append(item_snap)
-                        env["evidence"].append({"id": item_snap["id"], "source_id": item_snap["id"], "excerpt": f"{published} — {title} (from company-advertised activity feed)"[:600], "claim_fields": ["public_activity"]})
-                        activity_facts.append({"field": "company_activity", "value": {"title": title, "published_at": published}, "evidence_ids": [item_snap["id"]], "observed_at": item_snap["retrieved_at"], "valid_at": published, "source_url": item_url})
+                        feed_excerpts.append(f"{published} — {title}")
+                        activity_facts.append({"field": "company_activity", "value": {"title": title, "published_at": published, "article_url": item_url}, "evidence_ids": [feed_snap["id"]], "observed_at": feed_snap["retrieved_at"], "valid_at": published, "source_url": feed_url})
+                    if feed_excerpts:
+                        env["evidence"].append({"id": feed_snap["id"], "source_id": feed_snap["id"], "excerpt": "Company-advertised activity feed: " + " | ".join(feed_excerpts)[:550], "claim_fields": ["public_activity"]})
                 claim("public_activity", "available" if activity_facts else "not_available", activity_facts, None if activity_facts else "No dated, entity-matched company news or activity page was verified")
             else:
                 claim("web_presence","ambiguous",reason="Website does not independently identify the exact legal entity")
