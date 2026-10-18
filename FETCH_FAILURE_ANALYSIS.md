@@ -25,6 +25,12 @@ The full local suite passes **24/24 tests**, including exact-entity finance matc
 4. If production is intermittently unavailable, add a small bounded retry for transient connection/timeouts, then a per-run circuit breaker after repeated transport failures. Do not retry 404, 401/403, schema errors, or company-specific empty results. Ensure each skipped profile says the shared source was unavailable and that skipped requests do not count as outbound requests.
 5. Keep website `robots.txt` and fetch errors per domain. Retry them only on transient network errors, obey crawl delay and the total request/time limits, and retain a clear failure status rather than treating blocked pages as empty.
 
+## Retry and integrity follow-up (18 October 2026)
+
+The agent now makes one short retry for a GET that encounters a timeout/connection error or HTTP 500, 502, 503 or 504. It counts every retry as another outbound request. It does not retry access denials, rate limits, missing records or malformed responses. A targeted live rerun of `987441623` reached BRREG's documented production accounts path twice; both responses were HTTP 500. The finance claim correctly remains failed. This may be a persistent BRREG endpoint/record issue; the agent has no safe basis to infer financial values or change the status to unavailable.
+
+A second output integrity pass now requires a verified identity and matching evidence, source snapshot, organisation number, source family and fact field before publication. It drops inconsistent claims with an explicit `evidence_integrity` error. The full local suite passes 63 tests; a live one-company registry/roles profile passed the new validation gate. The full 100-company live batch should be rerun after this change when a short validation window is available; prior batch metrics are not attributed to the new gate.
+
 ## Source references
 
 - BRREG developer documentation: [environments and API URL](https://github.com/brreg/regnskapsregister-api/blob/main/docs/for-devs.md).

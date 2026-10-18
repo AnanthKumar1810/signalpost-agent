@@ -22,9 +22,9 @@ See [FETCH_FAILURE_ANALYSIS.md](FETCH_FAILURE_ANALYSIS.md) for the measured fail
 
 See [REFERENCE_EVALUATION.md](REFERENCE_EVALUATION.md) for the five isolated reference-project revisions, checks actually run, environment blockers and integration decisions.
 
-A registered website is fetched only over HTTPS after checking its `robots.txt`; private-address targets and cross-domain redirects are rejected. Website claims require the exact legal name or organisation number on the page. The agent does not scrape restricted social platforms. Company-owned jobs/news feeds, broader permitted search, and dated public-activity extraction are not implemented yet; those families remain explicitly unavailable rather than guessed.
+A registered website is fetched only over HTTPS after checking its `robots.txt`; private-address targets and cross-domain redirects are rejected. Website claims require the exact legal name or organisation number on the page. The agent does not scrape restricted social platforms. It checks a small number of same-domain job and dated news/press links, so coverage is limited; unsupported or inaccessible sources remain explicitly unavailable or failed rather than guessed. Optional LLM search results stay candidate-only unless their cited page, exact company identity, quote and date pass source checks.
 
-Each published fact points to a content-hashed source snapshot and includes a retrieval time. Financial records are additionally checked against the requested organisation number. The deterministic summary uses only sourced registry facts and lists unknown families. The evidence contains source links and excerpts; HTML output escapes untrusted content.
+Each published fact points to a content-hashed source snapshot and includes a retrieval time. A final integrity gate drops facts unless their evidence record and source snapshot agree on organisation number, source family and field. Financial records are additionally checked against the requested organisation number. The deterministic summary uses only sourced registry facts and lists unknown families. The evidence contains source links and excerpts; HTML output escapes untrusted content. Idempotent GET requests get one short retry after transient transport errors or HTTP 500/502/503/504; retries count toward the outbound-request total, and company-specific 404/403 responses are not retried.
 
 ## Checks
 
@@ -33,7 +33,7 @@ python -m unittest discover -s . -p 'test_*.py' -v
 python -m py_compile signalpost_agent.py claim_judge.py test_signalpost_agent.py test_input_stages.py test_claim_judge.py test_qa_regressions.py
 ```
 
-The local suite passes 59 tests covering input validation, entity matching, evidence, safe URL handling, output completeness, idempotency, dashboard escaping, financial validation, optional judge safeguards, source-page citation verification and a mocked 1,000-company batch. A live 100-company BRREG run returned 100 complete profiles in 95.1 seconds with 314 requests; 99 finance lookups returned data and one returned HTTP 500. See [the independent QA report](QA_TEST_REPORT.md) for the exact live and fixture results. The Builderr starter kit's refresh replay also passed locally with 2/2 expected changes, 0 false positives, 0 false negatives and an idempotent rerun. Its broader test suite could not be run here because the optional `extruct` dependency is not installed.
+The local suite passes 63 tests covering input validation, entity matching, evidence integrity, safe URL handling, bounded retry behavior, output completeness, idempotency, dashboard escaping, financial validation, optional judge safeguards, source-page citation verification and a mocked 1,000-company batch. A live 100-company BRREG run returned 100 complete profiles in 95.1 seconds with 314 requests; 99 finance lookups returned data and one returned HTTP 500. A fresh retry of that same company's finance endpoint still returned HTTP 500, so the finance claim remains failed. A live one-company check after the evidence-integrity gate preserved verified registry and role facts. See [the independent QA report](QA_TEST_REPORT.md) for exact results. The Builderr starter kit's refresh replay also passed locally with 2/2 expected changes, 0 false positives, 0 false negatives and an idempotent rerun. Its broader test suite could not be run here because the optional `extruct` dependency is not installed.
 
 ## Readiness
 
@@ -41,4 +41,4 @@ This package is executable and reviewable, but it is not a demonstrated qualifyi
 
 
 
-The final local package is not yet on the public repository. This task's GitHub write API returned HTTP 403; see the submission manifest for the existing remote revision.
+The public repository is [AnanthKumar1810/signalpost-agent](https://github.com/AnanthKumar1810/signalpost-agent). Check the submission manifest for the exact pushed revision and the distinction between repository publication and a Builderr submission.

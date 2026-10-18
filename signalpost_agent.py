@@ -97,10 +97,10 @@ def public_host(host: str) -> bool:
     return bool(addresses) and all(address.is_global for address in addresses)
 
 
-def get_json(url: str, timeout: float = 12) -> tuple[Any, bytes, int]:
+def get_json(url: str, timeout: float = 12, on_retry: Any = None) -> tuple[Any, bytes, int]:
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
     host=urllib.parse.urlparse(url).hostname or ""
-    with open_safe(req, host, timeout) as response:
+    with open_safe(req, host, timeout, on_retry=on_retry) as response:
         raw = response.read(2_000_001)
         if len(raw) > 2_000_000:
             raise ValueError("response exceeds 2 MB safety limit")
@@ -146,10 +146,25 @@ class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
         return self.do_open(PinnedHTTPSConnection, req, context=self._context)
 
 
-def open_safe(req: urllib.request.Request, host: str, timeout: float) -> Any:
+def open_safe(req: urllib.request.Request, host: str, timeout: float, on_retry: Any = None) -> Any:
     # Disable ambient HTTP(S)_PROXY settings so the checked address is the peer
     # that receives the connection; the custom HTTPS connection pins that peer.
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}), SameHostRedirect(host), PinnedHTTPSHandler()).open(req,timeout=timeout)
+    # These are idempotent GETs, so make one bounded retry for transient failures.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), SameHostRedirect(host), PinnedHTTPSHandler())
+    for attempt in range(2):
+        try:
+            return opener.open(req, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            if attempt or exc.code not in {500, 502, 503, 504}:
+                raise
+            exc.close()
+        except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError):
+            if attempt:
+                raise
+        if on_retry:
+            on_retry()
+        time.sleep(0.25)
+    raise RuntimeError("unreachable retry state")
 
 
 class PageParser(HTMLParser):
@@ -246,7 +261,7 @@ class Agent:
         self.db.execute("insert or ignore into snapshots values(?,?,?,?,?)", (org, family, digest, fetched, encoded))
         self.db.execute("insert into current_sources values(?,?,?,?,?) on conflict(org,family) do update set digest=excluded.digest,fetched_at=excluded.fetched_at,payload=excluded.payload", (org,family,digest,fetched,encoded))
         self.db.commit()
-        return {"id": f"{family}:{digest[:16]}", "url": source_url, "retrieved_at": fetched, "sha256": digest, "license": "NLOD 2.0" if "brreg.no" in urllib.parse.urlparse(source_url).netloc else "source terms apply", "changed": changed, "changed_fields": changed_fields, "previous_sha256": prior[0] if prior else None}
+        return {"id": f"{family}:{digest[:16]}", "family": family, "organisation_number": org, "url": source_url, "retrieved_at": fetched, "sha256": digest, "license": "NLOD 2.0" if "brreg.no" in urllib.parse.urlparse(source_url).netloc else "source terms apply", "changed": changed, "changed_fields": changed_fields, "previous_sha256": prior[0] if prior else None}
 
     def company(self, org: str) -> dict[str, Any]:
         org = normalize_org(org)
@@ -262,7 +277,7 @@ class Agent:
         url = f"{BRREG}/enheter/{org}"
         env["operations"]["requests"] += 1
         try:
-            data, raw, _ = get_json(url, self.timeout)
+            data, raw, _ = get_json(url, self.timeout, on_retry=lambda: env["operations"].__setitem__("requests", env["operations"]["requests"] + 1))
         except urllib.error.HTTPError as exc:
             env["errors"].append({"source": url, "type": "http_error", "status": exc.code, "message": str(exc)})
             status = "not_available" if exc.code in (404, 410) else "blocked" if exc.code in (401, 403, 429) else "failed"
@@ -342,7 +357,7 @@ class Agent:
         url = f"{ACCOUNTS}/{org}"
         env["operations"]["requests"] += 1
         try:
-            data, raw, _ = get_json(url, self.timeout)
+            data, raw, _ = get_json(url, self.timeout, on_retry=lambda: env["operations"].__setitem__("requests", env["operations"]["requests"] + 1))
             snap = self.snapshot(org, "financials", url, raw, data)
             env["source_snapshots"].append(snap)
             if snap["changed"]:
@@ -393,7 +408,7 @@ class Agent:
         url = f"{BRREG}/enheter/{org}/roller"
         env["operations"]["requests"] += 1
         try:
-            data, raw, _ = get_json(url, self.timeout)
+            data, raw, _ = get_json(url, self.timeout, on_retry=lambda: env["operations"].__setitem__("requests", env["operations"]["requests"] + 1))
             snap = self.snapshot(org, "roles", url, raw, data)
             env["source_snapshots"].append(snap)
             if snap["changed"]: env["changes"].append({"family":"people","source_id":snap["id"],"previous_sha256":snap["previous_sha256"],"sha256":snap["sha256"],"changed_fields":snap["changed_fields"]})
@@ -434,6 +449,7 @@ class Agent:
             claim("people", "failed", reason="Roles endpoint failed")
 
     def website(self, org: str, site: str, legal_name: str, env: dict[str, Any], claim: Any) -> None:
+        count_retry = lambda: env["operations"].__setitem__("requests", env["operations"]["requests"] + 1)
         try:
             raw_site = site if site.startswith(("https://", "http://")) else "https://" + site
             parsed = urllib.parse.urlparse(raw_site)
@@ -455,7 +471,7 @@ class Agent:
         try:
             robots_req = urllib.request.Request(robots_url, headers={"User-Agent":UA,"Accept":"text/plain"})
             try:
-                with open_safe(robots_req, parsed.hostname, self.timeout) as robots_response:
+                with open_safe(robots_req, parsed.hostname, self.timeout, on_retry=count_retry) as robots_response:
                     if urllib.parse.urlparse(robots_response.geturl()).hostname != parsed.hostname:
                         raise ValueError("cross-domain robots redirect rejected")
                     robots_body = robots_response.read(100_001)
@@ -486,7 +502,7 @@ class Agent:
         env["operations"]["requests"] += 1
         try:
             req = urllib.request.Request(url, headers={"User-Agent":UA,"Accept":"text/html"})
-            with open_safe(req, parsed.hostname, self.timeout) as resp:
+            with open_safe(req, parsed.hostname, self.timeout, on_retry=count_retry) as resp:
                 if urllib.parse.urlparse(resp.geturl()).hostname != parsed.hostname:
                     raise ValueError("cross-domain redirect rejected")
                 body=resp.read(1_000_001)
@@ -521,7 +537,7 @@ class Agent:
                         continue
                     env["operations"]["requests"] += 1
                     job_req=urllib.request.Request(job_url,headers={"User-Agent":UA,"Accept":"text/html"})
-                    with open_safe(job_req,parsed.hostname,self.timeout) as job_response:
+                    with open_safe(job_req,parsed.hostname,self.timeout,on_retry=count_retry) as job_response:
                         if urllib.parse.urlparse(job_response.geturl()).hostname!=parsed.hostname:
                             raise ValueError("cross-domain job-page redirect rejected")
                         job_body=job_response.read(500_001)
@@ -555,7 +571,7 @@ class Agent:
                     else:
                         env["operations"]["requests"] += 1
                         activity_req = urllib.request.Request(activity_url, headers={"User-Agent": UA, "Accept": "text/html"})
-                        with open_safe(activity_req, parsed.hostname, self.timeout) as activity_response:
+                        with open_safe(activity_req, parsed.hostname, self.timeout, on_retry=count_retry) as activity_response:
                             if urllib.parse.urlparse(activity_response.geturl()).hostname != parsed.hostname:
                                 raise ValueError("cross-domain activity redirect rejected")
                             activity_body = activity_response.read(500_001)
@@ -605,6 +621,10 @@ class Agent:
         env["run"]["finished_at"] = now()
         env["run"]["id"] = str(uuid.uuid4())
         env["run"]["status"] = "complete"
+        snapshots = {item.get("id"): item for item in env.get("source_snapshots", []) if isinstance(item, dict) and item.get("id")}
+        evidence = {item.get("id"): item for item in env.get("evidence", []) if isinstance(item, dict) and item.get("id")}
+        snapshot_families = {"company_details": {"registry"}, "people": {"roles"}, "locations": {"registry"},
+                             "financials": {"financials"}, "web_presence": {"website"}, "jobs": {"jobs"}, "public_activity": {"public_activity"}}
         claims: list[dict[str, Any]] = []
         present: set[str] = set()
         for item in env.get("claims", []):
@@ -619,6 +639,43 @@ class Agent:
             if item.get("status") not in STATES or not isinstance(item.get("facts", []), list):
                 env["errors"].append({"type": "internal_error", "message": f"Invalid claim for {family}; marked failed"})
                 item = {**item, "status": "failed", "facts": []}
+            facts = []
+            if item.get("facts") and (env.get("identity_anchor") or {}).get("status") != "verified":
+                env["errors"].append({"type": "evidence_integrity", "message": f"Facts for {family} dropped because the company identity is not verified"})
+            else:
+                for fact in item.get("facts", []):
+                    evidence_ids = fact.get("evidence_ids") if isinstance(fact, dict) else None
+                    source_family = snapshot_families.get(family, set())
+                    good_ids = isinstance(evidence_ids, list) and bool(evidence_ids)
+                    if good_ids:
+                        for evidence_id in evidence_ids:
+                            snap = snapshots.get(evidence_id)
+                            ev = evidence.get(evidence_id)
+                            if (not snap or not ev or snap.get("organisation_number") != env.get("organisation_number")
+                                    or snap.get("family") not in source_family or ev.get("source_id") != evidence_id):
+                                good_ids = False
+                                break
+                            field = fact.get("field")
+                            allowed_fields = {field, "public_activity" if field == "company_activity" else field}
+                            if not allowed_fields.intersection(ev.get("claim_fields", [])):
+                                good_ids = False
+                                break
+                            if fact.get("source_url") and fact["source_url"] != snap.get("url"):
+                                good_ids = False
+                                break
+                    try:
+                        json.dumps(fact.get("value"), allow_nan=False)
+                        good_value = fact.get("value") not in (None, "")
+                    except (TypeError, ValueError):
+                        good_value = False
+                    if good_ids and good_value:
+                        facts.append(fact)
+                    else:
+                        env["errors"].append({"type": "evidence_integrity", "message": f"Unsupported or mismatched fact dropped from {family}"})
+                item = {**item, "facts": facts}
+                if item.get("status") == "available" and not facts:
+                    item["status"] = "failed"
+                    item["reason"] = "All returned facts failed the evidence integrity check"
             claims.append(item)
         env["claims"] = claims
         for family in FAMILIES:

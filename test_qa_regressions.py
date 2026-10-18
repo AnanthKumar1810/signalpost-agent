@@ -14,7 +14,9 @@ import signalpost_agent as sp
 
 class QARegressionTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(dir=Path.cwd() / "work")
+        scratch = Path.cwd() / "work"
+        scratch.mkdir(parents=True, exist_ok=True)
+        self.tmp = tempfile.TemporaryDirectory(dir=scratch)
         self.addCleanup(self.tmp.cleanup)
         self.agent = sp.Agent(Path(self.tmp.name) / "state.sqlite3", website=False)
         self.addCleanup(self.agent.db.close)
@@ -246,6 +248,53 @@ class QARegressionTests(unittest.TestCase):
         self.assertEqual({c["family"] for c in claims}, set(sp.FAMILIES))
         self.assertEqual(next(c for c in claims if c["family"] == "company_details")["status"], "failed")
         self.assertTrue(any(e["type"] == "internal_error" for e in result["errors"]))
+
+    def test_finish_drops_fact_when_source_snapshot_belongs_to_another_company(self):
+        org = "923609016"
+        snap = self.agent.snapshot(org, "registry", f"{sp.BRREG}/enheter/{org}", b"fixture", {"organisasjonsnummer": org})
+        snap["organisation_number"] = "999999999"
+        env = {"organisation_number": org, "identity_anchor": {"status": "verified"},
+               "claims": [{"family": "company_details", "status": "available", "facts": [
+                   {"field": "legal_name", "value": "Wrong AS", "evidence_ids": [snap["id"]]}]}],
+               "source_snapshots": [snap], "evidence": [{"id": snap["id"], "source_id": snap["id"],
+                   "claim_fields": ["legal_name"], "excerpt": "Wrong AS"}], "errors": [], "changes": [], "run": {}, "operations": {}}
+        result = self.agent.finish(env, 0.0)
+        claim = next(item for item in result["claims"] if item["family"] == "company_details")
+        self.assertEqual(claim["facts"], [])
+        self.assertEqual(claim["status"], "failed")
+        self.assertTrue(any(error["type"] == "evidence_integrity" for error in result["errors"]))
+
+    def test_finish_drops_fact_when_evidence_field_does_not_match(self):
+        org = "923609016"
+        snap = self.agent.snapshot(org, "registry", f"{sp.BRREG}/enheter/{org}", b"fixture2", {"organisasjonsnummer": org})
+        env = {"organisation_number": org, "identity_anchor": {"status": "verified"},
+               "claims": [{"family": "company_details", "status": "available", "facts": [
+                   {"field": "legal_name", "value": "Example AS", "evidence_ids": [snap["id"]]}]}],
+               "source_snapshots": [snap], "evidence": [{"id": snap["id"], "source_id": snap["id"],
+                   "claim_fields": ["address"], "excerpt": "Example AS"}], "errors": [], "changes": [], "run": {}, "operations": {}}
+        result = self.agent.finish(env, 0.0)
+        self.assertEqual(next(item for item in result["claims"] if item["family"] == "company_details")["facts"], [])
+
+    def test_open_safe_retries_transient_server_error_and_counts_extra_request(self):
+        request = __import__("urllib.request").request.Request("https://example.no/")
+        response = type("Response", (), {"status": 200})()
+        opener = type("Opener", (), {"open": unittest.mock.Mock(side_effect=[
+            __import__("urllib.error").error.HTTPError(request.full_url, 500, "server error", {}, None), response])})()
+        callback = unittest.mock.Mock()
+        with patch.object(sp.urllib.request, "build_opener", return_value=opener), patch.object(sp.time, "sleep"):
+            self.assertIs(sp.open_safe(request, "example.no", 2, on_retry=callback), response)
+        self.assertEqual(opener.open.call_count, 2)
+        callback.assert_called_once_with()
+
+    def test_open_safe_does_not_retry_not_found(self):
+        request = __import__("urllib.request").request.Request("https://example.no/")
+        opener = type("Opener", (), {"open": unittest.mock.Mock(side_effect=__import__("urllib.error").error.HTTPError(request.full_url, 404, "not found", {}, None))})()
+        callback = unittest.mock.Mock()
+        with patch.object(sp.urllib.request, "build_opener", return_value=opener), patch.object(sp.time, "sleep"):
+            with self.assertRaises(__import__("urllib.error").error.HTTPError):
+                sp.open_safe(request, "example.no", 2, on_retry=callback)
+        self.assertEqual(opener.open.call_count, 1)
+        callback.assert_not_called()
 
     def test_cli_refuses_to_overwrite_input_with_output(self):
         source = self.write("same.txt", "not-a-valid-company-number\n")
