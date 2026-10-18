@@ -1,18 +1,23 @@
-# Submission manifest (draft)
+# Submission manifest
+
+Prepared: 18 October 2026
 
 - Repository: https://github.com/AnanthKumar1810/signalpost-agent
-- Exact commit: the final pushed `main` commit is reported in the delivery message and can be checked with `git rev-parse HEAD` after cloning the repository.
-- One-command run:
+- Tested source revision: `82d9ceb748ffeff3c5f8b22dd740fa017f204f2e` (the full source revision used for the recorded smoke run). The project documentation and submission bundle are prepared from that source tree; see the delivery ZIP manifest for its exact package contents.
+- One-command run from a clean checkout (Python 3.10+; standard library only):
   `python signalpost_agent.py --input smoke_100.json --output outputs/profiles.jsonl --state outputs/state.sqlite3 --timeout 12 --workers 4`
-- 100-company smoke command:
-  `python signalpost_agent.py --input smoke_100.json --output outputs/live-100-final.jsonl --state outputs/live-100-final.sqlite3 --timeout 5 --workers 4`
-- Runtime: the latest live integrated run returned 100 envelopes in 108,675 ms, using 322 requests and four workers. It recorded 1 available jobs profile, 1 available public-activity profile, and 99 available finance results; one finance request returned HTTP 500. The run report is beside `outputs/live-100-coverage-final.jsonl`. The 1,000-company automated test is fixture-backed and is not a measured live runtime.
-- Model/API: default mode makes no LLM or paid search calls. Sources are BRREG entity/roles and accounts endpoints, plus a BRREG-listed company website when robots and URL safety checks pass. RSS/Atom is checked only when advertised by that registered site. The optional `--nav-jobs` mode uses NAV's public job feed; it was tested with a three-page cap and found no matches in the 100-company sample, so it is not enabled by the one-command default. The optional web-search judge requires `OPENAI_API_KEY`; its citations are now fetched and checked for exact quote, company identity and publication date before being marked verified.
-- Cost: observed paid-provider API spend in the live 100-company default run was USD 0. Optional provider spend is unknown unless enabled and checked against provider billing. Local compute/network cost is not included.
-- Source rights: BRREG open data is NLOD 2.0 as described in its published specifications. The accounts API is a preview service. The corrected production endpoint returned finance records for 99 of 100 companies in the recorded live sample; one entity returned HTTP 500 twice, including a targeted retry. The failure remains explicit. See `FETCH_FAILURE_ANALYSIS.md`. Each company website remains subject to its own terms and robots policy. The implementation does not scrape restricted social platforms.
-- Test corpus: deterministic 100-row reservoir sample (seed 20261017) from Builderr's public universe, selected from all 411,160 rows. Sample metadata and the universe archive's published SHA-256 are in `smoke_100_sample.json`.
-- Contact: not configured. The owner must supply a contact before a formal entry. No personal address has been inserted or sent.
-- Official submission status: this GitHub push is code delivery only. It is not a Builderr email submission or official score/qualification.
+- Reproduce the recorded 100-company smoke run:
+  `python signalpost_agent.py --input smoke_100.json --output outputs/live-100-coverage-final.jsonl --state outputs/live-100-coverage-final.sqlite3 --timeout 5 --workers 4`
+- Recorded run: 100 input companies; 100 output envelopes; 100 verified identities; 322 outbound requests; 108,675 ms wall time with four workers; 4 reported errors. Finance returned data for 99 companies and one lookup ended in HTTP 500 after retry. Jobs and public activity each had 1 available, 96 not available, and 3 failed. Paid-provider spend was USD 0.00. See `outputs/live-100-coverage-final.jsonl.report.json` and the detailed judge report.
+- Model/API details: default mode uses no LLM and no paid search API. It uses BRREG registry, roles and accounts APIs, and conditionally checks the company's BRREG-listed website and its advertised RSS/Atom feeds. Optional NAV job search is available with `--nav-jobs`; the measured capped run found no matches. The optional LLM-assisted candidate search requires an API key; cited pages are fetched and checked before claims can be marked verified. It is not part of the default run.
+- Expected external API cost: measured USD 0 for the recorded default run. This excludes local compute and internet service charges. Any optional provider use incurs provider-specific costs that were not measured here.
+- Contact: Sirela Ananth Kumar, `sananthkumar3@gmail.com` (from the participant details provided for this project).
+- Test inputs and outputs: `smoke_100.json`, `smoke_100_sample.json`, and `outputs/live-100-coverage-final.jsonl` with its JSON report and HTML viewer.
+- Source and reuse: BRREG open data is published under NLOD 2.0. The accounts service is described as a preview and may be incomplete or unavailable. Third-party websites remain subject to their access rules and robots policies. Restricted social platforms are not scraped.
+- Official submission status: prepared for the participant to submit. No competition email or official submission has been sent. The official score and qualification can only be determined by Builderr's evaluation.
 
+## Profile-count requirement
 
+Builderr's current detailed “What to submit” instructions request a 100-company smoke-test report with one complete result per input. They also say Builderr provides the companies for official evaluations and precomputed company profiles or a company manifest are not needed for ranking. The public page also contains a shorter “Submit 1,000+ profiles” line, so the page is internally inconsistent. This bundle includes the explicitly detailed 100-company smoke test and the reusable agent; it does not claim that the 100 smoke profiles are a 1,000-profile dataset. Confirm the requirement with Builderr before relying on the shorter banner line.
 
+Official rules: https://builderr.ai/challenges/signalpost

@@ -1,16 +1,42 @@
 # Signalpost judge report
 
-**Date:** 17 October 2026  
-**Judgment:** A numerical score cannot be measured locally because Builderr's checked comparison collection is hidden. The earlier 44/100 estimate below was made before the accounts API route was corrected and is superseded; do not use it as a score for the current build.
+**Prepared:** 18 October 2026
+**Purpose:** independent local assessment of the prepared build; this is not Builderr's official score.
 
-## Current assessment: no verified numerical score
+## Finding
 
-The current live batch verified 100/100 identities and roles, returned financial data for 99/100 companies, and completed 100/100 envelopes. It found a verified company website for 1 company and an active vacancy for 1 company. This supports reliable execution and identity precision, but it does not reveal recall against Builderr's hidden verified corpus. No official score or qualification can be inferred from these counts.
+The project is runnable and its 100-company smoke-test artifact is complete. It is not possible to state a truthful score out of 100 from this local run: Builderr uses a checked comparison collection unavailable to us, and the official evaluation is the only source of a qualifying score. The older 44/100 estimate in an earlier draft was not measured against Builderr's rubric and is withdrawn. No local numerical score should be presented as an official or predicted result.
 
-The current smoke run used a deterministic random sample of 100 companies from the public universe. It returned 100 complete envelopes in 95.1 seconds wall time using four workers, with 314 requests and USD 0.00 paid API costs. The corrected accounts route succeeded for 99 companies; one request received HTTP 500. The machine-readable details are in `outputs/live-100-final.jsonl.report.json`.
+## Measured smoke run
 
-Identity, roles and evidence provenance are the strongest areas. Coverage is still limited: the website/job collector checks the BRREG-listed company site and a small number of same-host pages, while public activity is extracted only from dated, entity-matched company-site articles. More permitted sources would likely improve recall. An updated numerical estimate is not provided because local measurements cannot be mapped reliably to Builderr's hidden checked collection.
+The run used the fixed 100-company sample selected from 411,160 public-universe rows (seed 20261017). It produced 100 result envelopes for 100 distinct inputs and verified all 100 legal identities. Runtime was 108,675 ms wall time with four workers and 322 outbound requests. It recorded four source errors. Paid API cost was USD 0.00 because the default path uses no paid provider.
 
-Builderr's score should be treated as authoritative. Current requirements and the 100-company smoke-test rule are on [Builderr's Signalpost page](https://builderr.ai/challenges/signalpost).
+| Data family | Available | Not available | Ambiguous | Failed |
+|---|---:|---:|---:|---:|
+| Company details | 100 | 0 | 0 | 0 |
+| Registered location | 99 | 1 | 0 | 0 |
+| People / registered roles | 100 | 0 | 0 | 0 |
+| Financials | 99 | 0 | 0 | 1 |
+| Website presence | 1 | 92 | 4 | 3 |
+| Jobs | 1 | 96 | 0 | 3 |
+| Public activity | 1 | 96 | 0 | 3 |
 
-The project is packaged for review, but no repository commit hash is claimed here and no competition email or submission was sent.
+The single financial failure was a BRREG HTTP 500 response after a transient retry; no financial value was invented. Website, jobs, and activity failures reflect unavailable or blocked site retrievals. “Not available” means the configured permitted sources returned no usable fact; it does not prove the fact does not exist elsewhere. One activity profile included ten dated items from the company's registered website feed and passed the evidence-integrity checks. The optional NAV scan used four requests, was capped at three pages, found zero matching profiles, and reported truncation.
+
+Machine-readable run details: `outputs/live-100-coverage-final.jsonl.report.json`. The profile JSONL contains one envelope per input. The HTML file is a convenience viewer, not the source of truth.
+
+## Reliability and evidence controls
+
+The agent matches on Norwegian organisation number using BRREG as the identity anchor. Published facts retain source URL, retrieval time, excerpts and a content-hashed source snapshot. A final gate checks that claim, evidence and snapshot agree on company number, source family and field; financial claims also have the requested entity checked. A fact that fails these checks is dropped. A missing, blocked or failed source remains explicitly unavailable, ambiguous, or failed instead of becoming a guessed value. Retries are bounded and counted.
+
+The full local automated suite passed 71 tests on the tested source revision. These tests establish behavior for controlled cases; they do not establish live-world recall. The live 100-company run is the evidence for actual availability in this particular sample.
+
+## Competition readiness and limits
+
+The current official detailed instructions ask for a 100-company smoke-test result and the reproducibility metadata in the manifest. They state that Builderr supplies companies for official runs and that precomputed profiles are not used in ranking. The same page also shows a shorter “1,000+ profiles” line, which conflicts with its detailed instructions. The bundle addresses the detailed 100-company smoke-test requirement and documents that ambiguity; ask Builderr to resolve it before interpreting the banner as a required static dataset.
+
+The main performance weakness is coverage outside BRREG. Only one website was usable and only one jobs profile was found in this sample. The NAV test did not improve that result. Activity collection is limited to dated articles and feeds advertised by the BRREG-listed website. Restricted LinkedIn/Internshala scraping is intentionally not used. Precision, evidence integrity, and complete output shape are demonstrable locally; recall against Builderr's reference collection is not. The live run also demonstrates that an upstream API can fail for a specific company while the agent preserves a complete, honest profile.
+
+The code is prepared but has not been sent to Builderr. Any score, qualification decision, and leaderboard position remain pending official evaluation.
+
+Official challenge details: [Builderr Signalpost](https://builderr.ai/challenges/signalpost).
