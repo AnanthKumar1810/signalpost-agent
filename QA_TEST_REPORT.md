@@ -108,6 +108,14 @@ python -m py_compile signalpost_agent.py claim_judge.py test_signalpost_agent.py
 Exit code 0
 ```
 
+## Coverage-source follow-up (18 October 2026)
+
+The earlier statements that public activity was unimplemented and that live DNS prevented all source checks are historical QA snapshots. The current website collector already checks a small number of dated same-host news links; this follow-up adds feeds explicitly advertised by the registered company site. It fetches only same-host HTTPS RSS/Atom feeds allowed by `robots.txt`, requires a valid date and same-host article URL, preserves feed evidence, and records feed-specific failures without discarding other results. The RSS/Atom integration is covered by fixtures; a live improvement in activity coverage has not yet been measured.
+
+An optional NAV public job-feed collector was added and tested over the existing 100 verified profile results. A three-page run used 4 requests including the public token and found zero matching companies. A bounded 10-page experiment used 11 requests, found zero matching companies, and hit its page cap. The `?last` probe returned one active ad that did not match the target set. NAV did not improve measured coverage for this sample; the opt-in integration remains experimental. The client also caps page/detail counts and rejects redirects outside NAV's fixed HTTPS host.
+
+Current verification: `python -m unittest discover -s . -p 'test_*.py' -q` passed **71/71** tests; `python -m py_compile signalpost_agent.py nav_jobs.py claim_judge.py test_activity_feeds.py test_nav_jobs.py test_signalpost_agent.py test_input_stages.py test_claim_judge.py test_qa_regressions.py` passed. The historical live BRREG baseline is still 100 profiles, 316 requests, 103.5 seconds, with 1 available jobs result and public activity 97 unavailable / 3 failed. It was not regenerated after the new RSS code. See `COVERAGE_IMPROVEMENTS.md` for exact experiment counts, interpretation and the next recommended sources.
+
 These are fixture-backed checks and do not establish a competition score.
 
 ## Follow-up completion: live batch, finance correction and remaining safeguards (18 October 2026)

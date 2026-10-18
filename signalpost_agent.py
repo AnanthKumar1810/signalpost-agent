@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import email.utils
 import hashlib
 import html
 import http.client
@@ -15,6 +16,7 @@ import socket
 import sys
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 import urllib.error
 import urllib.parse
@@ -24,6 +26,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from urllib.robotparser import RobotFileParser
+from nav_jobs import NavJobFeed
 
 BRREG = "https://data.brreg.no/enhetsregisteret/api"
 # Query BRREG production. The PPE host is pre-production and has no service guarantee.
@@ -172,6 +175,7 @@ class PageParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.base, self.text, self.title, self.h1 = base, [], [], []
         self.links: list[tuple[str, str]] = []
+        self.feed_links: list[str] = []
         self.in_title = False
         self.in_h1 = False
         self.active_link: int | None = None
@@ -197,6 +201,11 @@ class PageParser(HTMLParser):
             date_key = " ".join(str(a.get(key) or "") for key in ("name", "property", "itemprop")).lower()
             if any(key in date_key for key in ("published_time", "datepublished", "date_published", "publish_date")) and a.get("content"):
                 self.published_dates.append(a["content"] or "")
+        if tag == "link" and a.get("href"):
+            rel = (a.get("rel") or "").lower().split()
+            media_type = (a.get("type") or "").lower().split(";")[0]
+            if "alternate" in rel and media_type in {"application/rss+xml", "application/atom+xml"}:
+                self.feed_links.append(urllib.parse.urljoin(self.base, a["href"] or ""))
         if tag == "time" and a.get("datetime"):
             self.published_dates.append(a["datetime"] or "")
         if tag == "title": self.in_title = True
@@ -599,6 +608,68 @@ class Agent:
                         env["changes"].append({"family": "public_activity", "source_id": activity_snap["id"], "previous_sha256": activity_snap["previous_sha256"], "sha256": activity_snap["sha256"], "changed_fields": activity_snap["changed_fields"]})
                     env["evidence"].append({"id": activity_snap["id"], "source_id": activity_snap["id"], "excerpt": f"{published} — {activity_title}: {activity_text[:400]}"[:600], "claim_fields": ["public_activity"]})
                     activity_facts.append({"field": "company_activity", "value": {"title": activity_title, "published_at": published}, "evidence_ids": [activity_snap["id"]], "observed_at": activity_snap["retrieved_at"], "valid_at": published, "source_url": activity_url})
+                # Prefer a feed the company site explicitly advertises. This
+                # improves coverage on sites whose homepage links do not expose
+                # individual articles, while keeping requests on the registered
+                # HTTPS host and honoring robots.txt.
+                for feed_url in list(dict.fromkeys(p.feed_links))[:2]:
+                    feed_parsed = urllib.parse.urlparse(feed_url)
+                    if (feed_parsed.scheme != "https" or feed_parsed.hostname != parsed.hostname
+                            or not parser.can_fetch(UA, feed_url)):
+                        continue
+                    env["operations"]["requests"] += 1
+                    feed_req = urllib.request.Request(feed_url, headers={"User-Agent": UA, "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml"})
+                    try:
+                        with open_safe(feed_req, parsed.hostname, self.timeout, on_retry=count_retry) as feed_response:
+                            if urllib.parse.urlparse(feed_response.geturl()).hostname != parsed.hostname:
+                                raise ValueError("cross-domain activity-feed redirect rejected")
+                            feed_body = feed_response.read(300_001)
+                            if len(feed_body) > 300_000:
+                                raise ValueError("activity feed exceeds 300 KB safety limit")
+                            if feed_response.headers.get_content_type() not in ("application/rss+xml", "application/atom+xml", "application/xml", "text/xml"):
+                                continue
+                    except Exception as feed_exc:
+                        env["errors"].append({"source": feed_url, "type": "activity_feed_error", "message": str(feed_exc)[:240]})
+                        continue
+                    try:
+                        root = ET.fromstring(feed_body)
+                    except ET.ParseError:
+                        continue
+                    feed_snap = self.snapshot(org, "public_activity", feed_url, feed_body, {"feed": "company-advertised RSS/Atom", "items": len(root)})
+                    env["source_snapshots"].append(feed_snap)
+                    entries = [node for node in root.iter() if node.tag.rsplit("}", 1)[-1].lower() in {"item", "entry"}]
+                    for entry in entries[:10]:
+                        parts = {node.tag.rsplit("}", 1)[-1].lower(): node for node in entry}
+                        title = " ".join((parts.get("title").itertext() if parts.get("title") is not None else []))
+                        title = " ".join(title.split())[:240]
+                        if not title:
+                            continue
+                        date_text = ""
+                        for date_key in ("published", "pubdate", "updated", "date"):
+                            if parts.get(date_key) is not None:
+                                date_text = " ".join(parts[date_key].itertext()).strip()
+                                if date_text:
+                                    break
+                        published = _iso_date(date_text[:10])
+                        if not published and date_text:
+                            try:
+                                published = email.utils.parsedate_to_datetime(date_text).date().isoformat()
+                            except (TypeError, ValueError, OverflowError):
+                                published = None
+                        if not published:
+                            continue
+                        item_url = ""
+                        if parts.get("link") is not None:
+                            link_node = parts["link"]
+                            item_url = link_node.attrib.get("href", "") or (link_node.text or "").strip()
+                        item_url = urllib.parse.urljoin(feed_url, item_url)
+                        item_parsed = urllib.parse.urlparse(item_url)
+                        if item_parsed.scheme != "https" or item_parsed.hostname != parsed.hostname:
+                            continue
+                        item_snap = self.snapshot(org, "public_activity", feed_url, feed_body, {"title": title, "published_at": published, "item_url": item_url})
+                        env["source_snapshots"].append(item_snap)
+                        env["evidence"].append({"id": item_snap["id"], "source_id": item_snap["id"], "excerpt": f"{published} — {title} (from company-advertised activity feed)"[:600], "claim_fields": ["public_activity"]})
+                        activity_facts.append({"field": "company_activity", "value": {"title": title, "published_at": published}, "evidence_ids": [item_snap["id"]], "observed_at": item_snap["retrieved_at"], "valid_at": published, "source_url": item_url})
                 claim("public_activity", "available" if activity_facts else "not_available", activity_facts, None if activity_facts else "No dated, entity-matched company news or activity page was verified")
             else:
                 claim("web_presence","ambiguous",reason="Website does not independently identify the exact legal entity")
@@ -799,6 +870,7 @@ def main() -> int:
     ap.add_argument("--timeout",type=float,default=12)
     ap.add_argument("--workers",type=int,default=4,help="Concurrent company lookups (default: 4)")
     ap.add_argument("--web-search-judge",action="store_true",help="Opt in to one OpenAI web-search call per valid company; results are unverified candidates, never facts")
+    ap.add_argument("--nav-jobs",action="store_true",help="Enable bounded, batch-level lookup through NAV's public job-feed API")
     args=ap.parse_args()
     if args.workers < 1 or args.workers > 16:
         ap.error("--workers must be between 1 and 16")
@@ -842,9 +914,38 @@ def main() -> int:
             return {"organisation_number":org,"identity_anchor":{"organisation_number":org,"status":"failed"},"claims":[{"family":family,"status":"failed","facts":[],"reason":"Unexpected per-company processing error"} for family in FAMILIES],"evidence":[],"source_snapshots":[],"errors":[{"type":"internal_error","message":str(exc)}],"changes":[],"summary":{"text":"No verified company facts are available because processing failed.","evidence_ids":[],"unknown_families":list(FAMILIES),"method":"deterministic evidence-grounded summary"},"run":{"id":str(uuid.uuid4()),"started_at":failed_at,"finished_at":failed_at,"status":"complete"},"operations":{"requests":0,"runtime_ms":0,"third_party_cost_usd":0.0}}
         finally:
             worker_agent.db.close()
+    with ThreadPoolExecutor(max_workers=(1 if judge else args.workers)) as pool:
+        results = list(pool.map(process, orgs))
+    nav_report = {"status": "disabled", "requests": 0, "matched_profiles": 0}
+    if args.nav_jobs and results:
+        nav_client = NavJobFeed(timeout=args.timeout)
+        nav_report = nav_client.enrich(results)
+        # NAV is a batch-level shared source. Attribute its shared request cost
+        # once, and count per-ad requests on the matching company profile.
+        if results:
+            results[0].setdefault("operations", {}).setdefault("shared_requests", 0)
+            results[0]["operations"]["shared_requests"] += nav_report.get("requests", 0)
+        for result in results:
+            org = str(result.get("organisation_number") or "")
+            for claim_item in result.get("claims", []):
+                if claim_item.get("family") != "jobs":
+                    continue
+                for fact in claim_item.get("facts", []):
+                    nav_url = fact.pop("_nav_url", None)
+                    excerpt = fact.pop("_nav_excerpt", None)
+                    if not nav_url:
+                        continue
+                    raw = json.dumps(fact.get("value"), ensure_ascii=False, sort_keys=True).encode("utf-8")
+                    snapshot = agent.snapshot(org, "jobs", nav_url, raw, fact.get("value"))
+                    result.setdefault("source_snapshots", []).append(snapshot)
+                    result.setdefault("evidence", []).append({"id": snapshot["id"], "source_id": snapshot["id"], "excerpt": excerpt or "NAV active job posting", "claim_fields": ["active_job"]})
+                    fact.update({"evidence_ids": [snapshot["id"]], "observed_at": snapshot["retrieved_at"], "valid_at": (fact.get("value") or {}).get("published_at"), "source_url": nav_url})
+            # Run the same final provenance gate after attaching shared-source facts.
+            prior_runtime = result.get("operations", {}).get("runtime_ms", 0)
+            agent.finish(result, time.monotonic() - prior_runtime / 1000)
+        agent.db.commit()
     with args.output.open("w",encoding="utf-8") as out:
-        with ThreadPoolExecutor(max_workers=(1 if judge else args.workers)) as pool:
-          for result in pool.map(process,orgs):
+        for result in results:
             out.write(json.dumps(result,ensure_ascii=False)+"\n"); out.flush(); n+=1
     agent.db.close()
     dashboard=make_dashboard(args.output)
@@ -857,7 +958,7 @@ def main() -> int:
     for row in read_jsonl_records(args.output):
         anchor=(row.get("identity_anchor") or {}).get("status","unknown")
         states[anchor]=states.get(anchor,0)+1
-        requests += (row.get("operations") or {}).get("requests",0)
+        requests += (row.get("operations") or {}).get("requests",0) + (row.get("operations") or {}).get("shared_requests",0)
         runtime += (row.get("operations") or {}).get("runtime_ms",0)
         row_cost = (row.get("operations") or {}).get("third_party_cost_usd",0)
         if row_cost is None:
@@ -868,7 +969,7 @@ def main() -> int:
         for c in row.get("claims",[]):
             bucket=families.setdefault(c.get("family","unknown"),{})
             status=c.get("status","unknown"); bucket[status]=bucket.get(status,0)+1
-    report={"input_count":len(orgs),"output_count":n,"unique_input_count":len(set(orgs)),"all_inputs_have_terminal_result":n==len(orgs),"identity_status_counts":states,"family_status_counts":families,"requests":requests,"runtime_ms_sum":runtime,"wall_runtime_ms":int((time.monotonic()-started_batch)*1000),"workers":1 if judge else args.workers,"errors":errors,"third_party_cost_usd":round(costs,6) if cost_known else None,"third_party_cost_status":"measured" if cost_known else "unknown; check provider billing","cost_basis":"no paid provider calls in default mode; opt-in provider billing is not available to this process","output":str(args.output),"dashboard":str(dashboard)}
+    report={"input_count":len(orgs),"output_count":n,"unique_input_count":len(set(orgs)),"all_inputs_have_terminal_result":n==len(orgs),"identity_status_counts":states,"family_status_counts":families,"requests":requests,"nav_job_feed":nav_report,"runtime_ms_sum":runtime,"wall_runtime_ms":int((time.monotonic()-started_batch)*1000),"workers":1 if judge else args.workers,"errors":errors,"third_party_cost_usd":round(costs,6) if cost_known else None,"third_party_cost_status":"measured" if cost_known else "unknown; check provider billing","cost_basis":"no paid provider calls in default mode; opt-in provider billing is not available to this process","output":str(args.output),"dashboard":str(dashboard)}
     args.output.with_suffix(args.output.suffix+".report.json").write_text(json.dumps(report,indent=2,ensure_ascii=False)+"\n",encoding="utf-8")
     print(json.dumps(report,ensure_ascii=False))
     return 0
