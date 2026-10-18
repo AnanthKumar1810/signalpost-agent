@@ -1,0 +1,50 @@
+{
+  "input_count": 100,
+  "output_count": 100,
+  "unique_input_count": 100,
+  "all_inputs_have_terminal_result": true,
+  "identity_status_counts": {
+    "verified": 100
+  },
+  "family_status_counts": {
+    "company_details": {
+      "available": 100
+    },
+    "locations": {
+      "available": 99,
+      "not_available": 1
+    },
+    "people": {
+      "available": 100
+    },
+    "financials": {
+      "available": 99,
+      "failed": 1
+    },
+    "web_presence": {
+      "not_available": 92,
+      "ambiguous": 4,
+      "failed": 3,
+      "available": 1
+    },
+    "jobs": {
+      "not_available": 96,
+      "failed": 3,
+      "available": 1
+    },
+    "public_activity": {
+      "not_available": 97,
+      "failed": 3
+    }
+  },
+  "requests": 314,
+  "runtime_ms_sum": 378156,
+  "wall_runtime_ms": 95067,
+  "workers": 4,
+  "errors": 4,
+  "third_party_cost_usd": 0.0,
+  "third_party_cost_status": "measured",
+  "cost_basis": "no paid provider calls in default mode; opt-in provider billing is not available to this process",
+  "output": "outputs\\live-100-final.jsonl",
+  "dashboard": "outputs\\live-100-final.jsonl.html"
+}

@@ -4,8 +4,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import html
+import http.client
 import ipaddress
 import json
+import math
 import os
 import re
 import sqlite3
@@ -13,6 +15,7 @@ import socket
 import sys
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,6 +26,7 @@ from typing import Any
 from urllib.robotparser import RobotFileParser
 
 BRREG = "https://data.brreg.no/enhetsregisteret/api"
+# Query BRREG production. The PPE host is pre-production and has no service guarantee.
 ACCOUNTS = "https://data.brreg.no/regnskapsregisteret/regnskap"
 CONTACT = re.sub(r"[^A-Za-z0-9@.+_-]", "", os.environ.get("SIGNALPOST_CONTACT", "contact-not-configured"))[:120]
 UA = f"SignalpostResearchAgent/0.2 (contact: {CONTACT})"
@@ -35,7 +39,8 @@ def now() -> str:
 
 
 def valid_org(value: str) -> bool:
-    if not re.fullmatch(r"\d{9}", value):
+    value = normalize_org(value)
+    if not re.fullmatch(r"[0-9]{9}", value):
         return False
     weights = (3, 2, 7, 6, 5, 4, 3, 2)
     check = sum(int(d) * w for d, w in zip(value[:8], weights)) % 11
@@ -43,14 +48,37 @@ def valid_org(value: str) -> bool:
     return digit != 10 and digit == int(value[8])
 
 
+def normalize_org(value: str) -> str:
+    """Normalize common display spacing while leaving other invalid characters visible."""
+    return re.sub(r"[\s\-]", "", str(value))
+
+
+def _iso_date(value: Any) -> str | None:
+    """Return a calendar date only when a source value is a valid ISO YYYY-MM-DD string."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        return None
+
+
 def _find_statements(value: Any, org: str) -> list[dict[str, Any]]:
     """Find only annual-account records whose embedded organisation number matches."""
     found: list[dict[str, Any]] = []
+    seen_nodes: set[int] = set()
+    seen_records: set[str] = set()
     def visit(node: Any) -> None:
+        if not isinstance(node, (dict, list)) or id(node) in seen_nodes:
+            return
+        seen_nodes.add(id(node))
         if isinstance(node, dict):
-            business = node.get("virksomhet") or {}
-            if business.get("organisasjonsnummer") == org and ("resultatregnskapResultat" in node or "eiendeler" in node):
-                found.append(node)
+            business = node.get("virksomhet")
+            if isinstance(business, dict) and business.get("organisasjonsnummer") == org and ("resultatregnskapResultat" in node or "eiendeler" in node):
+                record_key = json.dumps(node, ensure_ascii=False, sort_keys=True, allow_nan=True, default=str)
+                if record_key not in seen_records:
+                    found.append(node)
+                    seen_records.add(record_key)
             for child in node.values(): visit(child)
         elif isinstance(node, list):
             for child in node: visit(child)
@@ -83,13 +111,45 @@ class SameHostRedirect(urllib.request.HTTPRedirectHandler):
     def __init__(self, host: str): self.host = host
     def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
         parsed=urllib.parse.urlparse(newurl)
-        if parsed.scheme != "https" or parsed.hostname != self.host or parsed.port not in (None,443) or not public_host(parsed.hostname or ""):
+        if parsed.scheme != "https" or parsed.hostname != self.host or parsed.port not in (None,443) or parsed.username or parsed.password or not public_host(parsed.hostname or ""):
             raise ValueError("cross-domain or unsafe redirect rejected")
         return super().redirect_request(req,fp,code,msg,headers,newurl)
 
 
+class PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """Connect to a checked public IP while keeping TLS verification on the hostname."""
+    def connect(self) -> None:
+        if self._tunnel_host:
+            raise OSError("HTTPS proxy tunnels are disabled for safe company-site requests")
+        port = self.port or 443
+        addresses = socket.getaddrinfo(self.host, port, type=socket.SOCK_STREAM)
+        if not addresses:
+            raise OSError("hostname did not resolve to an address")
+        if any(not ipaddress.ip_address(item[4][0]).is_global for item in addresses):
+            raise OSError("hostname resolved to a non-public address")
+        last_error: OSError | None = None
+        for family, socktype, proto, _canonname, sockaddr in addresses:
+            raw_socket = socket.socket(family, socktype, proto)
+            raw_socket.settimeout(self.timeout)
+            try:
+                raw_socket.connect(sockaddr)
+                self.sock = self._context.wrap_socket(raw_socket, server_hostname=self.host)
+                return
+            except OSError as exc:
+                last_error = exc
+                raw_socket.close()
+        raise last_error or OSError("could not connect to a public address")
+
+
+class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req: urllib.request.Request) -> Any:
+        return self.do_open(PinnedHTTPSConnection, req, context=self._context)
+
+
 def open_safe(req: urllib.request.Request, host: str, timeout: float) -> Any:
-    return urllib.request.build_opener(SameHostRedirect(host)).open(req,timeout=timeout)
+    # Disable ambient HTTP(S)_PROXY settings so the checked address is the peer
+    # that receives the connection; the custom HTTPS connection pins that peer.
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), SameHostRedirect(host), PinnedHTTPSHandler()).open(req,timeout=timeout)
 
 
 class PageParser(HTMLParser):
@@ -99,30 +159,62 @@ class PageParser(HTMLParser):
         self.links: list[tuple[str, str]] = []
         self.in_title = False
         self.in_h1 = False
+        self.active_link: int | None = None
         self.jsonld: list[str] = []
         self.in_jsonld = False
+        self.meta_description: str | None = None
+        self.published_dates: list[str] = []
+        self._ignored_tags: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         a = dict(attrs)
+        if self._ignored_tags:
+            if tag in {"script", "style", "noscript", "template"}:
+                self._ignored_tags.append(tag)
+            return
+        if tag in {"script", "style", "noscript", "template"}:
+            self._ignored_tags.append(tag)
+            self.in_jsonld = tag == "script" and (a.get("type") or "").lower() == "application/ld+json"
+            return
+        if tag == "meta" and (a.get("name") or "").strip().lower() == "description" and a.get("content") and self.meta_description is None:
+            self.meta_description = html.unescape(a["content"] or "").strip()
+        if tag == "meta":
+            date_key = " ".join(str(a.get(key) or "") for key in ("name", "property", "itemprop")).lower()
+            if any(key in date_key for key in ("published_time", "datepublished", "date_published", "publish_date")) and a.get("content"):
+                self.published_dates.append(a["content"] or "")
+        if tag == "time" and a.get("datetime"):
+            self.published_dates.append(a["datetime"] or "")
         if tag == "title": self.in_title = True
         if tag == "h1": self.in_h1 = True
-        if tag == "script" and a.get("type") == "application/ld+json": self.in_jsonld = True
         if tag == "a" and a.get("href"):
             absolute = urllib.parse.urljoin(self.base, a["href"] or "")
             self.links.append((absolute, ""))
+            self.active_link = len(self.links) - 1
 
     def handle_endtag(self, tag: str) -> None:
+        if self._ignored_tags:
+            if tag == self._ignored_tags[-1]:
+                self._ignored_tags.pop()
+                if tag == "script": self.in_jsonld = False
+            return
         if tag == "title": self.in_title = False
         if tag == "h1": self.in_h1 = False
-        if tag == "script": self.in_jsonld = False
+        if tag == "a": self.active_link = None
 
     def handle_data(self, data: str) -> None:
+        if self._ignored_tags:
+            if self.in_jsonld:
+                self.jsonld.append(data)
+            return
         clean = " ".join(data.split())
         if clean:
             self.text.append(clean)
             if self.in_title: self.title.append(clean)
             if self.in_h1: self.h1.append(clean)
             if self.in_jsonld: self.jsonld.append(data)
+            if self.active_link is not None:
+                href, caption = self.links[self.active_link]
+                self.links[self.active_link] = (href, " ".join(part for part in (caption, clean) if part))
 
 
 class Agent:
@@ -157,6 +249,7 @@ class Agent:
         return {"id": f"{family}:{digest[:16]}", "url": source_url, "retrieved_at": fetched, "sha256": digest, "license": "NLOD 2.0" if "brreg.no" in urllib.parse.urlparse(source_url).netloc else "source terms apply", "changed": changed, "changed_fields": changed_fields, "previous_sha256": prior[0] if prior else None}
 
     def company(self, org: str) -> dict[str, Any]:
+        org = normalize_org(org)
         started = time.monotonic()
         env: dict[str, Any] = {"organisation_number": org, "identity_anchor": None, "claims": [], "evidence": [], "source_snapshots": [], "errors": [], "changes": [], "run": {"started_at": now()}, "operations": {"requests": 0, "runtime_ms": 0, "third_party_cost_usd": 0.0}}
         def claim(family: str, status: str, facts: list[dict[str, Any]] | None = None, reason: str | None = None) -> None:
@@ -185,13 +278,51 @@ class Agent:
             for family in FAMILIES:
                 if family != "company_details": claim(family, "failed", reason="Identity registry lookup did not complete")
             return self.finish(env, started)
+        if not isinstance(data, dict):
+            env["errors"].append({"source": url, "type": "invalid_identity_shape", "message": "Registry response was not a JSON object"})
+            env["identity_anchor"] = {"organisation_number": org, "status": "failed"}
+            claim("company_details", "failed", reason="Registry response had an invalid shape")
+            for family in FAMILIES:
+                if family != "company_details": claim(family, "failed", reason="Identity registry lookup did not complete")
+            return self.finish(env, started)
+        returned_org = data.get("organisasjonsnummer")
+        if not isinstance(returned_org, str) or normalize_org(returned_org) != org:
+            env["errors"].append({"source": url, "type": "identity_mismatch", "message": "Registry response organisation number did not match the requested number"})
+            env["identity_anchor"] = {"organisation_number": org, "status": "failed"}
+            claim("company_details", "failed", reason="Registry entity could not be matched to the requested organisation number")
+            for family in FAMILIES:
+                if family != "company_details": claim(family, "failed", reason="Identity registry lookup did not complete")
+            return self.finish(env, started)
         snap = self.snapshot(org, "registry", url, raw, data)
         env["source_snapshots"].append(snap)
         if snap["changed"]: env["changes"].append({"family":"company_details","source_id":snap["id"],"previous_sha256":snap["previous_sha256"],"sha256":snap["sha256"],"changed_fields":snap["changed_fields"]})
         name = data.get("navn")
-        env["identity_anchor"] = {"organisation_number": org, "legal_name": name, "organisation_form": (data.get("organisasjonsform") or {}).get("kode"), "registry_url": url, "evidence_id": snap["id"], "status": "verified"}
-        registry_fields = {"legal_name": name, "organisation_form": (data.get("organisasjonsform") or {}).get("kode"), "registered_at": data.get("registreringsdatoEnhetsregisteret"), "industry_code": (data.get("naeringskode1") or {}).get("kode"), "industry_description": (data.get("naeringskode1") or {}).get("beskrivelse"), "employee_count": data.get("antallAnsatte"), "website": data.get("hjemmeside"), "municipality": (data.get("forretningsadresse") or {}).get("kommune"), "postal_code": (data.get("forretningsadresse") or {}).get("postnummer"), "city": (data.get("forretningsadresse") or {}).get("poststed"), "address": data.get("forretningsadresse")}
-        facts = [{"field": k, "value": v, "evidence_ids": [snap["id"]], "observed_at": snap["retrieved_at"], "valid_at": data.get("registreringsdatoEnhetsregisteret")} for k,v in registry_fields.items() if v not in (None, "", {})]
+        organisation_form = data.get("organisasjonsform")
+        organisation_form = organisation_form if isinstance(organisation_form, dict) else {}
+        industry = data.get("naeringskode1")
+        industry = industry if isinstance(industry, dict) else {}
+        address = data.get("forretningsadresse")
+        address = address if isinstance(address, dict) else {}
+        env["identity_anchor"] = {"organisation_number": org, "legal_name": name, "organisation_form": organisation_form.get("kode"), "registry_url": url, "evidence_id": snap["id"], "status": "verified"}
+        registry_fields = {"legal_name": name, "organisation_form": organisation_form.get("kode"), "registered_at": data.get("registreringsdatoEnhetsregisteret"), "industry_code": industry.get("kode"), "industry_description": industry.get("beskrivelse"), "employee_count": data.get("antallAnsatte"), "website": data.get("hjemmeside"), "municipality": address.get("kommune"), "postal_code": address.get("postnummer"), "city": address.get("poststed"), "address": address or None}
+        # These status/date fields are documented in BRREG's Enhetsregisteret v2 entity response.
+        # Emit positive statuses only; absence or false is not a noteworthy event.
+        status_fields = {
+            "bankruptcy": ("konkurs", "konkursdato"),
+            "under_liquidation": ("underAvvikling", "underAvviklingDato"),
+            "under_forced_liquidation": ("underTvangsavviklingEllerTvangsopplosning", None),
+        }
+        status_date_values: dict[str, str] = {}
+        for output_field, (flag_key, date_key) in status_fields.items():
+            if data.get(flag_key) is True:
+                registry_fields[output_field] = True
+                if date_key:
+                    status_date = _iso_date(data.get(date_key))
+                    if status_date:
+                        date_field = f"{output_field}_date"
+                        registry_fields[date_field] = status_date
+                        status_date_values[date_field] = status_date
+        facts = [{"field": k, "value": v, "evidence_ids": [snap["id"]], "observed_at": snap["retrieved_at"], "valid_at": (_iso_date(data.get("registreringsdatoEnhetsregisteret")) if k == "registered_at" else status_date_values.get(k))} for k,v in registry_fields.items() if v not in (None, "", {})]
         env["evidence"].append({"id": snap["id"], "source_id": snap["id"], "excerpt": "; ".join(f"{f['field']}={f['value']}" for f in facts)[:1000], "claim_fields": [f["field"] for f in facts]})
         claim("company_details", "available" if facts else "not_available", facts)
         claim("locations", "available" if registry_fields["address"] else "not_available", [f for f in facts if f["field"] in {"address", "municipality", "postal_code", "city"}])
@@ -208,7 +339,7 @@ class Agent:
 
     def financials(self, org: str, env: dict[str, Any], claim: Any) -> None:
         """Read BRREG's public latest-year key figures as a separately evidenced source."""
-        url = f"{ACCOUNTS}?{urllib.parse.urlencode({'orgNummer': org})}"
+        url = f"{ACCOUNTS}/{org}"
         env["operations"]["requests"] += 1
         try:
             data, raw, _ = get_json(url, self.timeout)
@@ -218,13 +349,27 @@ class Agent:
                 env["changes"].append({"family": "financials", "source_id": snap["id"], "previous_sha256": snap["previous_sha256"], "sha256": snap["sha256"], "changed_fields": snap["changed_fields"]})
             facts: list[dict[str, Any]] = []
             for statement in _find_statements(data, org):
+                if statement.get("valuta") != "NOK":
+                    continue
                 period = statement.get("regnskapsperiode") or {}
                 result = statement.get("resultatregnskapResultat") or {}
+                if not isinstance(period, dict) or not isinstance(result, dict):
+                    continue
                 operating = result.get("driftsresultat") or {}
+                if not isinstance(operating, dict):
+                    continue
                 revenue = operating.get("driftsinntekter") or {}
+                if not isinstance(revenue, dict):
+                    revenue = {}
                 equity_debt = statement.get("egenkapitalGjeld") or {}
+                if not isinstance(equity_debt, dict):
+                    equity_debt = {}
                 equity = equity_debt.get("egenkapital") or {}
+                if not isinstance(equity, dict):
+                    equity = {}
                 assets = statement.get("eiendeler") or {}
+                if not isinstance(assets, dict):
+                    assets = {}
                 for field, amount in {
                     "revenue_nok": revenue.get("sumDriftsinntekter"),
                     "operating_result_nok": operating.get("driftsresultat"),
@@ -232,7 +377,7 @@ class Agent:
                     "total_assets_nok": assets.get("sumEiendeler"),
                     "equity_nok": equity.get("sumEgenkapital"),
                 }.items():
-                    if isinstance(amount, (int, float)) and not isinstance(amount, bool):
+                    if isinstance(amount, (int, float)) and not isinstance(amount, bool) and math.isfinite(amount):
                         facts.append({"field": field, "value": amount, "currency": statement.get("valuta"), "evidence_ids": [snap["id"]], "observed_at": snap["retrieved_at"], "valid_at": period.get("tilDato"), "reporting_period": period})
             env["evidence"].append({"id": snap["id"], "source_id": snap["id"], "excerpt": "BRREG annual-account key figures matched to the requested organisation number", "claim_fields": sorted({fact["field"] for fact in facts})})
             claim("financials", "available" if facts else "not_available", facts, None if facts else "No public key figures were returned for this entity")
@@ -254,11 +399,31 @@ class Agent:
             if snap["changed"]: env["changes"].append({"family":"people","source_id":snap["id"],"previous_sha256":snap["previous_sha256"],"sha256":snap["sha256"],"changed_fields":snap["changed_fields"]})
             roles = data.get("rollegrupper", []) if isinstance(data, dict) else []
             facts = []
-            for group in roles:
-                for item in group.get("roller", []):
-                    person = item.get("person") or {}
-                    value = {"role": item.get("type", {}).get("beskrivelse"), "name": " ".join(x for x in [person.get("navn"), person.get("etternavn")] if x)}
-                    if value["name"]: facts.append({"field":"registered_role","value":value,"evidence_ids":[snap["id"]],"observed_at":snap["retrieved_at"],"valid_at":None})
+            if isinstance(roles, list):
+                for group in roles:
+                    if not isinstance(group, dict):
+                        continue
+                    group_roles = group.get("roller", [])
+                    if not isinstance(group_roles, list):
+                        continue
+                    for item in group_roles:
+                        if not isinstance(item, dict):
+                            continue
+                        person = item.get("person")
+                        if not isinstance(person, dict):
+                            continue
+                        # BRREG documents names under person.navn. Accept the
+                        # equivalent flat fields too for older/alternate payloads.
+                        name_data = person.get("navn")
+                        name_fields = name_data if isinstance(name_data, dict) else person
+                        parts = [name_fields.get(key) for key in ("fornavn", "mellomnavn", "etternavn")]
+                        if not any(isinstance(part, str) and part.strip() for part in parts):
+                            # Preserve compatibility with payloads that return
+                            # person.navn as a single display-name string.
+                            parts = [name_data, person.get("etternavn")]
+                        name = " ".join(str(part).strip() for part in parts if isinstance(part, str) and part.strip())
+                        value = {"role": (item.get("type") or {}).get("beskrivelse") if isinstance(item.get("type"), dict) else None, "name": name}
+                        if value["name"]: facts.append({"field":"registered_role","value":value,"evidence_ids":[snap["id"]],"observed_at":snap["retrieved_at"],"valid_at":None})
             env["evidence"].append({"id":snap["id"],"source_id":snap["id"],"excerpt":"; ".join(f"{x['value'].get('role')}: {x['value'].get('name')}" for x in facts)[:1000],"claim_fields":["registered_role"]})
             claim("people", "available" if facts else "not_available", facts)
         except urllib.error.HTTPError as exc:
@@ -269,9 +434,17 @@ class Agent:
             claim("people", "failed", reason="Roles endpoint failed")
 
     def website(self, org: str, site: str, legal_name: str, env: dict[str, Any], claim: Any) -> None:
-        raw_site = site if site.startswith(("https://", "http://")) else "https://" + site
-        parsed = urllib.parse.urlparse(raw_site)
-        if parsed.scheme != "https" or not parsed.hostname or parsed.port not in (None,443) or parsed.username or parsed.password or not public_host(parsed.hostname):
+        try:
+            raw_site = site if site.startswith(("https://", "http://")) else "https://" + site
+            parsed = urllib.parse.urlparse(raw_site)
+            safe_url = parsed.scheme == "https" and bool(parsed.hostname) and parsed.port in (None,443) and not parsed.username and not parsed.password and public_host(parsed.hostname or "")
+        except (TypeError, ValueError) as exc:
+            env["errors"].append({"source": str(site), "type": "invalid_website_url", "message": str(exc)})
+            claim("web_presence", "failed", reason="Registry website URL could not be parsed safely")
+            claim("jobs", "failed", reason="Website URL could not be parsed safely")
+            claim("public_activity", "failed", reason="Website URL could not be parsed safely")
+            return
+        if not safe_url:
             claim("web_presence", "ambiguous", reason="Registry website URL is not safe HTTPS")
             claim("jobs", "not_available", reason="Website URL was not crawled")
             claim("public_activity", "not_available", reason="Website URL was not crawled")
@@ -327,7 +500,7 @@ class Agent:
             # A registry-declared domain is a verified relationship, but page claims need the legal name or exact org number.
             identity_heading = " ".join(p.title + p.h1)
             name_match=bool(legal_name and re.search(r"(?<![\w])" + re.escape(legal_name) + r"(?![\w])", identity_heading, re.I))
-            org_match=org in page_text
+            org_match=bool(re.search(r"(?<![0-9])" + re.escape(org) + r"(?![0-9])", page_text))
             snap=self.snapshot(org,"website",url,body,{"title":title,"text":page_text[:8000]})
             env["source_snapshots"].append(snap)
             if snap["changed"]: env["changes"].append({"family":"web_presence","source_id":snap["id"],"previous_sha256":snap["previous_sha256"],"sha256":snap["sha256"],"changed_fields":snap["changed_fields"]})
@@ -335,45 +508,131 @@ class Agent:
             env["evidence"].append(ev)
             if name_match or org_match:
                 facts=[{"field":"website_title","value":title,"evidence_ids":[snap["id"]],"observed_at":snap["retrieved_at"],"valid_at":None}]
-                desc=re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)',text,re.I)
-                if desc: facts.append({"field":"website_description","value":html.unescape(desc.group(1)),"evidence_ids":[snap["id"]],"observed_at":snap["retrieved_at"],"valid_at":None})
+                if p.meta_description: facts.append({"field":"website_description","value":p.meta_description,"evidence_ids":[snap["id"]],"observed_at":snap["retrieved_at"],"valid_at":None})
                 claim("web_presence","available",facts)
-                careers=[]
-                for href,_ in p.links:
+                job_pages=[]
+                for href,caption in p.links:
                     full=urllib.parse.urlparse(href)
-                    if full.hostname==parsed.hostname and re.search(r"career|job|ledig|stilling|karriere",full.path,re.I):
-                        careers.append(href)
-                # A careers landing page is not evidence of an active vacancy.
-                claim("jobs", "not_available", reason=("Careers link found, but no active vacancy was verified" if careers else "No active vacancy was verified"))
+                    if full.hostname==parsed.hostname and full.scheme=="https" and re.search(r"vacan|job|position|stilling|ledig",full.path+" "+caption,re.I):
+                        job_pages.append(urllib.parse.urlunparse((full.scheme,full.netloc,full.path,"","","")))
+                job_facts=[]
+                for job_url in list(dict.fromkeys(job_pages))[:2]:
+                    if not parser.can_fetch(UA,job_url):
+                        continue
+                    env["operations"]["requests"] += 1
+                    job_req=urllib.request.Request(job_url,headers={"User-Agent":UA,"Accept":"text/html"})
+                    with open_safe(job_req,parsed.hostname,self.timeout) as job_response:
+                        if urllib.parse.urlparse(job_response.geturl()).hostname!=parsed.hostname:
+                            raise ValueError("cross-domain job-page redirect rejected")
+                        job_body=job_response.read(500_001)
+                        if len(job_body)>500_000: raise ValueError("job page exceeds 500 KB safety limit")
+                        if job_response.headers.get_content_type() not in ("text/html","application/xhtml+xml"):
+                            continue
+                    job_text=job_body.decode("utf-8",errors="replace")
+                    job_parser=PageParser(job_url); job_parser.feed(job_text)
+                    job_title=" ".join(job_parser.h1).strip() or " ".join(job_parser.title).strip()
+                    job_words=" ".join(job_parser.text)
+                    accepting=bool(re.search(r"apply(?: now)?|submit (?:your )?application|søk(?: nå| på stillingen)?",job_words,re.I))
+                    closed=bool(re.search(r"position (?:is )?closed|applications? (?:are )?closed|no longer accepting|stillingen er besatt|søknadsfristen er utløpt",job_words,re.I))
+                    if job_title and accepting and not closed:
+                        job_snap=self.snapshot(org,"jobs",job_url,job_body,{"title":job_title,"text":job_words[:3000]})
+                        env["source_snapshots"].append(job_snap)
+                        if job_snap["changed"]: env["changes"].append({"family":"jobs","source_id":job_snap["id"],"previous_sha256":job_snap["previous_sha256"],"sha256":job_snap["sha256"],"changed_fields":job_snap["changed_fields"]})
+                        env["evidence"].append({"id":job_snap["id"],"source_id":job_snap["id"],"excerpt":(job_title+" — "+job_words[:500])[:600],"claim_fields":["active_job_title"]})
+                        job_facts.append({"field":"active_job_title","value":job_title,"evidence_ids":[job_snap["id"]],"observed_at":job_snap["retrieved_at"],"valid_at":None,"source_url":job_url})
+                claim("jobs","available" if job_facts else "not_available",job_facts,None if job_facts else "No current vacancy with an application action was verified")
+                activity_pages = [url]
+                for href, caption in p.links:
+                    full = urllib.parse.urlparse(href)
+                    if full.hostname == parsed.hostname and full.scheme == "https" and re.search(r"news|press|blog|article|aktuelt|nyheter|nyhet", full.path + " " + caption, re.I):
+                        activity_pages.append(urllib.parse.urlunparse((full.scheme, full.netloc, full.path, "", "", "")))
+                activity_facts = []
+                for activity_url in list(dict.fromkeys(activity_pages))[:3]:
+                    if activity_url != url and not parser.can_fetch(UA, activity_url):
+                        continue
+                    if activity_url == url:
+                        activity_body, activity_parser = body, p
+                    else:
+                        env["operations"]["requests"] += 1
+                        activity_req = urllib.request.Request(activity_url, headers={"User-Agent": UA, "Accept": "text/html"})
+                        with open_safe(activity_req, parsed.hostname, self.timeout) as activity_response:
+                            if urllib.parse.urlparse(activity_response.geturl()).hostname != parsed.hostname:
+                                raise ValueError("cross-domain activity redirect rejected")
+                            activity_body = activity_response.read(500_001)
+                            if len(activity_body) > 500_000:
+                                raise ValueError("activity page exceeds 500 KB safety limit")
+                            if activity_response.headers.get_content_type() not in ("text/html", "application/xhtml+xml"):
+                                continue
+                        activity_parser = PageParser(activity_url)
+                        activity_parser.feed(activity_body.decode("utf-8", errors="replace"))
+                    activity_heading = " ".join(activity_parser.title + activity_parser.h1)
+                    activity_text = " ".join(activity_parser.text)
+                    exact_name = bool(legal_name and re.search(r"(?<![\w])" + re.escape(legal_name) + r"(?![\w])", activity_heading + " " + activity_text, re.I))
+                    exact_org = bool(re.search(r"(?<![0-9])" + re.escape(org) + r"(?![0-9])", activity_text))
+                    if not (exact_name or exact_org):
+                        continue
+                    published = next((value[:10] for value in activity_parser.published_dates if _iso_date(value[:10])), None)
+                    if not published:
+                        continue
+                    activity_title = activity_heading.strip()
+                    if not activity_title:
+                        continue
+                    activity_snap = self.snapshot(org, "public_activity", activity_url, activity_body, {"title": activity_title, "published_at": published, "text": activity_text[:3000]})
+                    env["source_snapshots"].append(activity_snap)
+                    if activity_snap["changed"]:
+                        env["changes"].append({"family": "public_activity", "source_id": activity_snap["id"], "previous_sha256": activity_snap["previous_sha256"], "sha256": activity_snap["sha256"], "changed_fields": activity_snap["changed_fields"]})
+                    env["evidence"].append({"id": activity_snap["id"], "source_id": activity_snap["id"], "excerpt": f"{published} — {activity_title}: {activity_text[:400]}"[:600], "claim_fields": ["public_activity"]})
+                    activity_facts.append({"field": "company_activity", "value": {"title": activity_title, "published_at": published}, "evidence_ids": [activity_snap["id"]], "observed_at": activity_snap["retrieved_at"], "valid_at": published, "source_url": activity_url})
+                claim("public_activity", "available" if activity_facts else "not_available", activity_facts, None if activity_facts else "No dated, entity-matched company news or activity page was verified")
             else:
                 claim("web_presence","ambiguous",reason="Website does not independently identify the exact legal entity")
                 claim("jobs","not_available",reason="Website entity match failed; no jobs published")
-            claim("public_activity","not_available",reason="No dated activity/article extraction implemented")
+                claim("public_activity","not_available",reason="Website entity match failed; no activity published")
         except urllib.error.HTTPError as exc:
-            st="blocked" if exc.code in (401,403,429) else "failed"
+            st="not_available" if exc.code in (404,410) else "blocked" if exc.code in (401,403,429) else "failed"
             env["errors"].append({"source":url,"type":"http_error","status":exc.code,"message":str(exc)})
             claim("web_presence",st,reason=f"Company site returned HTTP {exc.code}")
             claim("jobs",st,reason="Company site could not be checked")
+            claim("public_activity",st,reason="Company site could not be checked")
         except Exception as exc:
             env["errors"].append({"source":url,"type":"fetch_error","message":str(exc)})
             claim("web_presence","failed",reason="Company website fetch or parse failed")
             claim("jobs","failed",reason="Company website could not be checked")
+            claim("public_activity","failed",reason="Company website could not be checked")
 
     def finish(self, env: dict[str, Any], started: float) -> dict[str, Any]:
         env["operations"]["runtime_ms"] = int((time.monotonic()-started)*1000)
         env["run"]["finished_at"] = now()
         env["run"]["id"] = str(uuid.uuid4())
         env["run"]["status"] = "complete"
-        assert all(c["status"] in STATES for c in env["claims"])
-        families = [c["family"] for c in env["claims"]]
-        assert len(families) == len(set(families)), "each claim family must have one terminal status"
-        assert set(families) == set(FAMILIES), "each company must have a terminal status for every claim family"
+        claims: list[dict[str, Any]] = []
+        present: set[str] = set()
+        for item in env.get("claims", []):
+            if not isinstance(item, dict):
+                env["errors"].append({"type": "internal_error", "message": "Malformed claim was dropped"})
+                continue
+            family = item.get("family")
+            if family not in FAMILIES or family in present:
+                env["errors"].append({"type": "internal_error", "message": f"Unknown or duplicate claim family {family!r} was dropped"})
+                continue
+            present.add(family)
+            if item.get("status") not in STATES or not isinstance(item.get("facts", []), list):
+                env["errors"].append({"type": "internal_error", "message": f"Invalid claim for {family}; marked failed"})
+                item = {**item, "status": "failed", "facts": []}
+            claims.append(item)
+        env["claims"] = claims
+        for family in FAMILIES:
+            if family not in present:
+                env["claims"].append({"family": family, "status": "failed", "facts": [], "reason": "No terminal result was produced for this information family"})
+                env["errors"].append({"type": "internal_error", "message": f"Missing terminal claim for {family}; emitted a failed status"})
         env["summary"] = self._summary(env)
         return env
 
     @staticmethod
     def _summary(env: dict[str, Any]) -> dict[str, Any]:
         anchor = env.get("identity_anchor") or {}
+        if anchor.get("status") != "verified":
+            return {"text": "Company identity could not be verified; no company-specific facts are available.", "evidence_ids": [], "unknown_families": list(FAMILIES), "method": "deterministic evidence-grounded summary"}
         by_family = {claim["family"]: claim for claim in env["claims"]}
         details = by_family.get("company_details", {}).get("facts", [])
         fields = {fact.get("field"): fact for fact in details}
@@ -385,29 +644,84 @@ class Agent:
         if form: clauses[0] += f" as {form}"
         if industry: clauses.append(f"its registered industry is {industry}")
         if city: clauses.append(f"its registered business address is in {city}")
+        if fields.get("bankruptcy", {}).get("value") is True: clauses.append("the registry marks it as bankrupt")
+        if fields.get("under_liquidation", {}).get("value") is True: clauses.append("the registry marks it as under liquidation")
+        if fields.get("under_forced_liquidation", {}).get("value") is True: clauses.append("the registry marks it as under forced liquidation or dissolution")
         evidence_ids = sorted({eid for fact in details for eid in fact.get("evidence_ids", [])})
         unknowns = [family for family in ("financials", "jobs", "public_activity") if by_family.get(family, {}).get("status") != "available"]
         return {"text": "; ".join(clauses) + ".", "evidence_ids": evidence_ids, "unknown_families": unknowns, "method": "deterministic evidence-grounded summary"}
 
 
 def load_orgs(path: Path) -> list[str]:
-    content=path.read_text(encoding="utf-8-sig")
-    if path.suffix.lower()==".json":
-        obj=json.loads(content)
-        if isinstance(obj,dict):
-            obj = [obj] if any(k in obj for k in ("organisation_number","orgnr")) else obj.get("companies",obj.get("organisations",obj.get("data",[])))
-        return [str(x.get("organisation_number",x.get("orgnr",""))) if isinstance(x,dict) else str(x) for x in obj]
-    rows=[]
-    for line in content.splitlines():
-        if not line.strip(): continue
+    content = path.read_text(encoding="utf-8-sig")
+
+    def record_value(value: Any, location: str) -> str:
+        if isinstance(value, str):
+            return normalize_org(value)
+        if isinstance(value, dict):
+            for key in ("organisation_number", "orgnr"):
+                if key in value:
+                    if not isinstance(value[key], str):
+                        raise ValueError(f"{location}: {key} must be a string")
+                    return normalize_org(value[key])
+            raise ValueError(f"{location}: expected organisation_number or orgnr")
+        raise ValueError(f"{location}: expected a string or company object, got {type(value).__name__}")
+
+    suffix = path.suffix.lower()
+    if suffix == ".json":
         try:
-            x=json.loads(line); rows.append(str(x.get("organisation_number",x.get("orgnr",""))) if isinstance(x,dict) else str(x))
-        except json.JSONDecodeError: rows.append(line.strip())
+            obj = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid JSON input: {exc}") from exc
+        if isinstance(obj, dict):
+            if any(key in obj for key in ("organisation_number", "orgnr")):
+                obj = [obj]
+            else:
+                for key in ("companies", "organisations", "data"):
+                    if key in obj:
+                        obj = obj[key]
+                        break
+                else:
+                    raise ValueError("JSON object must contain a company record or companies/organisations/data array")
+        if not isinstance(obj, list):
+            raise ValueError("JSON batch root must be an array or supported object")
+        return [record_value(item, f"JSON record {index + 1}") for index, item in enumerate(obj)]
+
+    if suffix == ".jsonl":
+        rows = []
+        for line_number, line in enumerate(content.split("\n"), 1):
+            line = line.rstrip("\r")
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid JSONL record on line {line_number}: {exc.msg}") from exc
+            rows.append(record_value(value, f"JSONL line {line_number}"))
+        return rows
+
+    return [normalize_org(line.strip()) for line in content.splitlines() if line.strip()]
+
+
+def read_jsonl_records(path: Path) -> list[dict[str, Any]]:
+    """Read JSONL using LF record boundaries; Unicode separators are valid string data."""
+    rows = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").split("\n"), 1):
+        line = line.rstrip("\r")
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid JSONL record on line {line_number}: {exc.msg}") from exc
+        if not isinstance(value, dict):
+            raise ValueError(f"JSONL line {line_number}: profile record must be a JSON object")
+        rows.append(value)
     return rows
 
 
 def make_dashboard(jsonl_path: Path) -> Path:
-    rows=[json.loads(line) for line in jsonl_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    rows=read_jsonl_records(jsonl_path)
     embedded=json.dumps(rows,ensure_ascii=False).replace("<","\\u003c").replace(">","\\u003e").replace("&","\\u0026")
     page='''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Signalpost company profiles</title>
 <style>
@@ -426,17 +740,54 @@ def main() -> int:
     ap.add_argument("--state",type=Path,default=Path("signalpost.sqlite3"))
     ap.add_argument("--no-website",action="store_true")
     ap.add_argument("--timeout",type=float,default=12)
+    ap.add_argument("--workers",type=int,default=4,help="Concurrent company lookups (default: 4)")
+    ap.add_argument("--web-search-judge",action="store_true",help="Opt in to one OpenAI web-search call per valid company; results are unverified candidates, never facts")
     args=ap.parse_args()
-    orgs=load_orgs(args.input)
+    if args.workers < 1 or args.workers > 16:
+        ap.error("--workers must be between 1 and 16")
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        ap.error("--timeout must be a positive finite number")
+    resolved_paths = {"input": args.input.resolve(), "output": args.output.resolve(), "state": args.state.resolve()}
+    if resolved_paths["input"] == resolved_paths["output"]:
+        ap.error("--input and --output must be different files")
+    if resolved_paths["state"] in (resolved_paths["input"], resolved_paths["output"]):
+        ap.error("--state must be a different file from --input and --output")
+    try:
+        orgs=load_orgs(args.input)
+    except (OSError, ValueError) as exc:
+        ap.error(f"could not read input batch: {exc}")
     args.output.parent.mkdir(parents=True,exist_ok=True)
+    judge = None
+    if args.web_search_judge:
+        try:
+            from claim_judge import WebSearchJudge
+            judge = WebSearchJudge(max_calls=1)
+        except Exception as exc:
+            ap.error(f"could not enable web-search judge: {exc}")
     agent=Agent(args.state,not args.no_website,args.timeout)
     n=0
+    started_batch=time.monotonic()
+    def process(org: str) -> dict[str, Any]:
+        worker_agent=Agent(args.state,not args.no_website,args.timeout)
+        try:
+            result=worker_agent.company(org)
+            if judge and result.get("identity_anchor", {}).get("status") == "verified":
+                candidates = judge.discover(org,result["identity_anchor"].get("legal_name") or "")
+                candidates = judge.verify_citations(candidates, org, result["identity_anchor"].get("legal_name") or "")
+                result["web_search_candidates"] = candidates
+                result["operations"]["requests"] += candidates.get("calls_made", 0) + candidates.get("verification_requests", 0)
+                if candidates.get("calls_made", 0):
+                    result["operations"]["third_party_cost_usd"] = None
+                    result["operations"]["third_party_cost_note"] = "Provider cost was not measured; check the OpenAI usage dashboard."
+            return result
+        except Exception as exc:
+            failed_at=now()
+            return {"organisation_number":org,"identity_anchor":{"organisation_number":org,"status":"failed"},"claims":[{"family":family,"status":"failed","facts":[],"reason":"Unexpected per-company processing error"} for family in FAMILIES],"evidence":[],"source_snapshots":[],"errors":[{"type":"internal_error","message":str(exc)}],"changes":[],"summary":{"text":"No verified company facts are available because processing failed.","evidence_ids":[],"unknown_families":list(FAMILIES),"method":"deterministic evidence-grounded summary"},"run":{"id":str(uuid.uuid4()),"started_at":failed_at,"finished_at":failed_at,"status":"complete"},"operations":{"requests":0,"runtime_ms":0,"third_party_cost_usd":0.0}}
+        finally:
+            worker_agent.db.close()
     with args.output.open("w",encoding="utf-8") as out:
-        for org in orgs:
-            try: result=agent.company(org)
-            except Exception as exc:
-                failed_at=now()
-                result={"organisation_number":org,"identity_anchor":{"organisation_number":org,"status":"failed"},"claims":[{"family":family,"status":"failed","facts":[],"reason":"Unexpected per-company processing error"} for family in FAMILIES],"evidence":[],"source_snapshots":[],"errors":[{"type":"internal_error","message":str(exc)}],"changes":[],"summary":{"text":"No verified company facts are available because processing failed.","evidence_ids":[],"unknown_families":list(FAMILIES),"method":"deterministic evidence-grounded summary"},"run":{"id":str(uuid.uuid4()),"started_at":failed_at,"finished_at":failed_at,"status":"complete"},"operations":{"requests":0,"runtime_ms":0,"third_party_cost_usd":0.0}}
+        with ThreadPoolExecutor(max_workers=(1 if judge else args.workers)) as pool:
+          for result in pool.map(process,orgs):
             out.write(json.dumps(result,ensure_ascii=False)+"\n"); out.flush(); n+=1
     agent.db.close()
     dashboard=make_dashboard(args.output)
@@ -445,18 +796,22 @@ def main() -> int:
     requests = runtime = 0
     errors = 0
     costs = 0.0
-    for line in args.output.read_text(encoding="utf-8").splitlines():
-        row=json.loads(line)
+    cost_known = True
+    for row in read_jsonl_records(args.output):
         anchor=(row.get("identity_anchor") or {}).get("status","unknown")
         states[anchor]=states.get(anchor,0)+1
         requests += (row.get("operations") or {}).get("requests",0)
         runtime += (row.get("operations") or {}).get("runtime_ms",0)
-        costs += (row.get("operations") or {}).get("third_party_cost_usd",0)
+        row_cost = (row.get("operations") or {}).get("third_party_cost_usd",0)
+        if row_cost is None:
+            cost_known = False
+        else:
+            costs += row_cost
         errors += len(row.get("errors",[]))
         for c in row.get("claims",[]):
             bucket=families.setdefault(c.get("family","unknown"),{})
             status=c.get("status","unknown"); bucket[status]=bucket.get(status,0)+1
-    report={"input_count":len(orgs),"output_count":n,"unique_input_count":len(set(orgs)),"all_inputs_have_terminal_result":n==len(orgs),"identity_status_counts":states,"family_status_counts":families,"requests":requests,"runtime_ms_sum":runtime,"errors":errors,"third_party_cost_usd":round(costs,6),"cost_basis":"actual third-party API charges; this implementation makes no paid API calls","output":str(args.output),"dashboard":str(dashboard)}
+    report={"input_count":len(orgs),"output_count":n,"unique_input_count":len(set(orgs)),"all_inputs_have_terminal_result":n==len(orgs),"identity_status_counts":states,"family_status_counts":families,"requests":requests,"runtime_ms_sum":runtime,"wall_runtime_ms":int((time.monotonic()-started_batch)*1000),"workers":1 if judge else args.workers,"errors":errors,"third_party_cost_usd":round(costs,6) if cost_known else None,"third_party_cost_status":"measured" if cost_known else "unknown; check provider billing","cost_basis":"no paid provider calls in default mode; opt-in provider billing is not available to this process","output":str(args.output),"dashboard":str(dashboard)}
     args.output.with_suffix(args.output.suffix+".report.json").write_text(json.dumps(report,indent=2,ensure_ascii=False)+"\n",encoding="utf-8")
     print(json.dumps(report,ensure_ascii=False))
     return 0
