@@ -15,6 +15,7 @@ import sqlite3
 import socket
 import sys
 import time
+import unicodedata
 import uuid
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
@@ -27,6 +28,7 @@ from pathlib import Path
 from typing import Any
 from urllib.robotparser import RobotFileParser
 from nav_jobs import NavJobFeed
+from wikidata_websites import WikidataWebsiteDiscovery
 
 BRREG = "https://data.brreg.no/enhetsregisteret/api"
 # Query BRREG production. The PPE host is pre-production and has no service guarantee.
@@ -54,6 +56,67 @@ def valid_org(value: str) -> bool:
 def normalize_org(value: str) -> str:
     """Normalize common display spacing while leaving other invalid characters visible."""
     return re.sub(r"[\s\-]", "", str(value))
+
+
+_LEGAL_FORM_SUFFIXES = {"as", "asa", "ans", "da", "enk", "nuf", "sa", "ba", "sam", "iks", "sti"}
+
+
+def _normalized_name_tokens(value: str) -> list[str]:
+    value = value.translate(str.maketrans({"ø": "o", "Ø": "O", "å": "a", "Å": "A", "æ": "ae", "Æ": "AE"}))
+    value = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii").casefold()
+    return re.findall(r"[a-z0-9]+", value)
+
+
+def legal_name_matches_page(legal_name: str, page_text: str, identity_heading: str = "") -> bool:
+    """Match the full registered name in page text, optionally without legal form.
+
+    This is used only on a BRREG-listed or identifier-discovered domain. The
+    suffix-stripped form requires at least two distinctive tokens; short names
+    still need the exact organisation number to avoid weak matches.
+    """
+    name_tokens = _normalized_name_tokens(legal_name)
+    page_tokens = _normalized_name_tokens(page_text)
+    if not name_tokens or not page_tokens:
+        return False
+    heading_tokens = _normalized_name_tokens(identity_heading)
+    if len(name_tokens) == 1 and len(name_tokens[0]) >= 4:
+        if any(heading_tokens[index:index + 1] == name_tokens for index in range(len(heading_tokens))):
+            return True
+    elif len(name_tokens) >= 2 and any(
+        heading_tokens[index:index + len(name_tokens)] == name_tokens
+        for index in range(max(0, len(heading_tokens) - len(name_tokens) + 1))
+    ):
+        return True
+
+    # Full-page references can be boilerplate or even explicit denials. Use a
+    # body-only name match only when the distinctive part has at least two
+    # substantive words. A short name must appear in the identity heading or be
+    # corroborated by the exact organisation number.
+    distinctive = name_tokens[:-1] if name_tokens[-1] in _LEGAL_FORM_SUFFIXES else name_tokens
+    if len(distinctive) < 2 or not all(len(token) >= 3 for token in distinctive):
+        return False
+    candidates = [name_tokens]
+    if name_tokens[-1] in _LEGAL_FORM_SUFFIXES:
+        stripped = name_tokens[:-1]
+        if len(stripped) >= 2 and all(len(token) >= 3 for token in stripped):
+            candidates.append(stripped)
+    for candidate in candidates:
+        width = len(candidate)
+        if width <= len(page_tokens) and any(
+            page_tokens[index:index + width] == candidate
+            for index in range(len(page_tokens) - width + 1)
+        ):
+            return True
+    return False
+
+
+def page_has_organisation_number(page_text: str, organisation_number: str) -> bool:
+    """Recognize the exact nine-digit identifier with common display spacing."""
+    expected = normalize_org(organisation_number)
+    for candidate in re.findall(r"(?<!\d)\d(?:[\s.\-]*\d){8}(?!\d)", page_text):
+        if re.sub(r"\D", "", candidate) == expected:
+            return True
+    return False
 
 
 def _iso_date(value: Any) -> str | None:
@@ -522,17 +585,22 @@ class Agent:
             p=PageParser(url); p.feed(text)
             title=" ".join(p.title).strip()
             page_text=" ".join(p.text)
-            # A registry-declared domain is a verified relationship, but page claims need the legal name or exact org number.
+            # A registry-declared or exact-identifier-discovered domain is a lead,
+            # not identity proof. Require the full legal name (including or
+            # excluding its legal-form suffix) somewhere on the page, or the exact
+            # organisation number. This recovers footer/about-page identities
+            # without accepting partial name overlap.
             identity_heading = " ".join(p.title + p.h1)
-            name_match=bool(legal_name and re.search(r"(?<![\w])" + re.escape(legal_name) + r"(?![\w])", identity_heading, re.I))
-            org_match=bool(re.search(r"(?<![0-9])" + re.escape(org) + r"(?![0-9])", page_text))
+            name_match = legal_name_matches_page(legal_name, page_text, identity_heading)
+            org_match = page_has_organisation_number(page_text, org)
             snap=self.snapshot(org,"website",url,body,{"title":title,"text":page_text[:8000]})
             env["source_snapshots"].append(snap)
             if snap["changed"]: env["changes"].append({"family":"web_presence","source_id":snap["id"],"previous_sha256":snap["previous_sha256"],"sha256":snap["sha256"],"changed_fields":snap["changed_fields"]})
-            ev={"id":snap["id"],"source_id":snap["id"],"excerpt":(title+" — "+page_text[:500])[:600],"claim_fields":["website_title","website_description"]}
+            ev={"id":snap["id"],"source_id":snap["id"],"excerpt":(title+" — "+page_text[:500])[:600],"claim_fields":["website_url","website_title","website_description"]}
             env["evidence"].append(ev)
             if name_match or org_match:
-                facts=[{"field":"website_title","value":title,"evidence_ids":[snap["id"]],"observed_at":snap["retrieved_at"],"valid_at":None}]
+                facts=[{"field":"website_url","value":url,"evidence_ids":[snap["id"]],"observed_at":snap["retrieved_at"],"valid_at":None},
+                       {"field":"website_title","value":title or urllib.parse.urlparse(url).hostname,"evidence_ids":[snap["id"]],"observed_at":snap["retrieved_at"],"valid_at":None}]
                 if p.meta_description: facts.append({"field":"website_description","value":p.meta_description,"evidence_ids":[snap["id"]],"observed_at":snap["retrieved_at"],"valid_at":None})
                 claim("web_presence","available",facts)
                 job_pages=[]
@@ -872,9 +940,12 @@ def main() -> int:
     ap.add_argument("--workers",type=int,default=4,help="Concurrent company lookups (default: 4)")
     ap.add_argument("--web-search-judge",action="store_true",help="Opt in to one OpenAI web-search call per valid company; results are unverified candidates, never facts")
     ap.add_argument("--nav-jobs",action="store_true",help="Enable bounded, batch-level lookup through NAV's public job-feed API")
+    ap.add_argument("--wikidata-websites",action="store_true",help="Discover website candidates via exact Wikidata P2333 matches, then independently verify each site")
     args=ap.parse_args()
     if args.workers < 1 or args.workers > 16:
         ap.error("--workers must be between 1 and 16")
+    if args.wikidata_websites and args.no_website:
+        ap.error("--wikidata-websites requires website fetching; remove --no-website")
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         ap.error("--timeout must be a positive finite number")
     resolved_paths = {"input": args.input.resolve(), "output": args.output.resolve(), "state": args.state.resolve()}
@@ -917,6 +988,51 @@ def main() -> int:
             worker_agent.db.close()
     with ThreadPoolExecutor(max_workers=(1 if judge else args.workers)) as pool:
         results = list(pool.map(process, orgs))
+    wikidata_report = {"status": "disabled", "requests": 0, "target_count": 0, "candidate_count": 0, "errors": []}
+    if args.wikidata_websites and results:
+        discovery = WikidataWebsiteDiscovery(timeout=min(args.timeout, 8))
+        candidates, wikidata_report = discovery.discover(results)
+        results[0].setdefault("operations", {}).setdefault("shared_requests", 0)
+        results[0]["operations"]["shared_requests"] += wikidata_report.get("requests", 0)
+        # Apply only candidates whose Wikidata entity has the exact requested
+        # organisation number. P856 remains a lead: website() must independently
+        # verify the fetched page before any web, jobs, or activity fact is kept.
+        for result in results:
+            org = str(result.get("organisation_number") or "")
+            candidate = candidates.get(org)
+            result["website_discovery"] = {
+                "status": "candidate_found" if candidate else "not_found",
+                "method": "wikidata_p2333_exact_to_p856",
+                "candidate_url": candidate.get("site") if candidate else None,
+            }
+            if not candidate:
+                if org in discovery.failed_organisations:
+                    for item in result.get("claims", []):
+                        if item.get("family") == "web_presence" and item.get("reason") == "No registry-listed website":
+                            item["status"] = "failed"
+                            item["reason"] = "Wikidata website discovery failed; no BRREG-listed website was available"
+                    result.setdefault("errors", []).append({"type": "website_discovery_failed", "source": "https://query.wikidata.org/sparql", "message": "The exact-identifier website discovery request failed for this company"})
+                elif result["website_discovery"]["status"] == "not_found":
+                    for item in result.get("claims", []):
+                        if item.get("family") == "web_presence" and item.get("reason") == "No registry-listed website":
+                            item["reason"] = "No BRREG-listed website or exact-identifier Wikidata website candidate was found"
+                continue
+            statement = {"organisation_number": org, "wikidata_item": candidate["item"], "property": "P856", "candidate_url": candidate["site"]}
+            statement_raw = json.dumps(statement, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            snapshot = agent.snapshot(org, "website_discovery", candidate["item"], statement_raw, statement)
+            snapshot["license"] = "CC0 (Wikidata structured data)"
+            result.setdefault("source_snapshots", []).append(snapshot)
+            result.setdefault("evidence", []).append({
+                "id": snapshot["id"], "source_id": snapshot["id"],
+                "excerpt": f"Wikidata {candidate['qid']} has exact Norwegian organisation-number property P2333={org} and lists P856={candidate['site']}; candidate only, not identity proof.",
+                "claim_fields": ["website_candidate"],
+            })
+            result["claims"] = [item for item in result.get("claims", []) if item.get("family") not in {"web_presence", "jobs", "public_activity"}]
+            def add_site_claim(family: str, status: str, facts: list[dict[str, Any]] | None = None, reason: str | None = None, _result: dict[str, Any] = result) -> None:
+                _result.setdefault("claims", []).append({"family": family, "status": status, "facts": facts or [], **({"reason": reason} if reason else {})})
+            agent.website(org, candidate["site"], (result.get("identity_anchor") or {}).get("legal_name") or "", result, add_site_claim)
+            prior_runtime = result.get("operations", {}).get("runtime_ms", 0)
+            agent.finish(result, time.monotonic() - prior_runtime / 1000)
     nav_report = {"status": "disabled", "requests": 0, "matched_profiles": 0}
     if args.nav_jobs and results:
         nav_client = NavJobFeed(timeout=args.timeout)
@@ -970,7 +1086,7 @@ def main() -> int:
         for c in row.get("claims",[]):
             bucket=families.setdefault(c.get("family","unknown"),{})
             status=c.get("status","unknown"); bucket[status]=bucket.get(status,0)+1
-    report={"input_count":len(orgs),"output_count":n,"unique_input_count":len(set(orgs)),"all_inputs_have_terminal_result":n==len(orgs),"identity_status_counts":states,"family_status_counts":families,"requests":requests,"nav_job_feed":nav_report,"runtime_ms_sum":runtime,"wall_runtime_ms":int((time.monotonic()-started_batch)*1000),"workers":1 if judge else args.workers,"errors":errors,"third_party_cost_usd":round(costs,6) if cost_known else None,"third_party_cost_status":"measured" if cost_known else "unknown; check provider billing","cost_basis":"no paid provider calls in default mode; opt-in provider billing is not available to this process","output":str(args.output),"dashboard":str(dashboard)}
+    report={"input_count":len(orgs),"output_count":n,"unique_input_count":len(set(orgs)),"all_inputs_have_terminal_result":n==len(orgs),"identity_status_counts":states,"family_status_counts":families,"requests":requests,"nav_job_feed":nav_report,"wikidata_website_discovery":wikidata_report,"runtime_ms_sum":runtime,"wall_runtime_ms":int((time.monotonic()-started_batch)*1000),"workers":1 if judge else args.workers,"errors":errors,"third_party_cost_usd":round(costs,6) if cost_known else None,"third_party_cost_status":"measured" if cost_known else "unknown; check provider billing","cost_basis":"no paid provider calls in default mode; opt-in provider billing is not available to this process","output":str(args.output),"dashboard":str(dashboard)}
     args.output.with_suffix(args.output.suffix+".report.json").write_text(json.dumps(report,indent=2,ensure_ascii=False)+"\n",encoding="utf-8")
     print(json.dumps(report,ensure_ascii=False))
     return 0

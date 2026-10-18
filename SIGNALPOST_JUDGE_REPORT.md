@@ -29,7 +29,7 @@ Machine-readable run details: `outputs/live-100-coverage-final.jsonl.report.json
 
 The agent matches on Norwegian organisation number using BRREG as the identity anchor. Published facts retain source URL, retrieval time, excerpts and a content-hashed source snapshot. A final gate checks that claim, evidence and snapshot agree on company number, source family and field; financial claims also have the requested entity checked. A fact that fails these checks is dropped. A missing, blocked or failed source remains explicitly unavailable, ambiguous, or failed instead of becoming a guessed value. Retries are bounded and counted.
 
-The full local automated suite passed 71 tests on the tested source revision. These tests establish behavior for controlled cases; they do not establish live-world recall. The live 100-company run is the evidence for actual availability in this particular sample.
+The historical live-run revision passed 71 local tests. The current source tree passes 78 local tests after adding conservative website matching and optional Wikidata exact-ID discovery. These tests establish behavior on controlled cases; they do not establish live-world recall or coverage lift. The saved live 100-company run predates the optional Wikidata path.
 
 ## Competition readiness and limits
 
@@ -40,3 +40,9 @@ The main performance weakness is coverage outside BRREG. Only one website was us
 The code is prepared but has not been sent to Builderr. Any score, qualification decision, and leaderboard position remain pending official evaluation.
 
 Official challenge details: [Builderr Signalpost](https://builderr.ai/challenges/signalpost).
+
+## Coverage diagnosis and current changes
+
+The supplied 2025 universe contains 411,160 rows; 44,855 (10.91%) list a BRREG website. Among AS entities, the rate is 8.8%, and among industry-code-68 entities it is 4.9%. In the saved 100-company run, 92 profiles had no registered website, four were ambiguous, and three failed retrieval. The three fetched ambiguous pages did not contain the exact organisation number or distinctive legal name in their saved text. Therefore widening legal-name matching alone would have rescued none of these cases and cannot fix the dominant no-website gap.
+
+Current code scans full page text for a distinctive normalized legal name (including a suffix-free variant) while preserving exact organisation-number matching and rejecting weak short-name mentions. It also offers `--wikidata-websites`: a website candidate is returned only from a Wikidata record whose Norwegian organisation-number property exactly matches the profile. The candidate remains untrusted until the site's existing safe-fetch, access-policy and page-identity checks pass. The connector has not been verified against live Wikidata because this environment could not resolve its endpoint. The measured live coverage figures above are unchanged; no uplift or score increase is claimed. The full current local suite passes 78 tests.

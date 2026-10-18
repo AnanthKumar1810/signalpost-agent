@@ -4,6 +4,21 @@
 
 A paid scraping API is not required for the current improvements. We tested NAV's official public job-vacancy feed and expanded first-party website activity discovery. The results show that these changes improve the collection method, but do not yet demonstrate a useful increase in the 100-company sample. In particular, the NAV path found **zero** matching companies in the bounded live experiment, so jobs coverage is not solved.
 
+## Root-cause audit and follow-up implementation — 18 October 2026
+
+The uploaded 2025 company universe contains 411,160 rows. Only 44,855 (10.91%) have a non-empty BRREG website field; 366,305 (89.09%) do not. Website registration is especially sparse in the dominant AS form (33,281/376,956; 8.8%) and in industry code 68 real-estate entities (4,411/90,187; 4.9%). This is the main measured reason website-backed jobs and activity coverage is low. The 100-company smoke sample had a lower 8/100 registered-site rate.
+
+In the final saved smoke output, web presence was available for 1 company, unavailable for 92 because no BRREG site was listed, ambiguous for 4, and failed for 3 retrieval cases. Of the ambiguous results, three were fetched pages and one was an unsafe non-HTTPS URL. The three fetched pages were checked against their saved page-text snapshots. None contained the exact registered name (with or without legal-form suffix) or the requested organisation number. Therefore widening the name check alone would have rescued 0/3 in this batch. It would be wrong to claim that the strict heading check explains the 92 no-site outcomes.
+
+Two bounded fixes are implemented:
+
+- Legal-name verification now searches the whole fetched text for the complete distinctive name, optionally without its legal-form suffix. A short/single-token name is not accepted from body text alone; an exact organisation number remains the strongest proof. Formatted organisation numbers (for example `923 609 016`) are normalized before comparison. The original 100-company saved pages gain no verified sites from this change; fixtures cover cases the old matcher would miss and guard against partial and weak matches.
+- `--wikidata-websites` adds a no-key, batched lookup for verified profiles without a BRREG-listed website. It selects P856 only from a Wikidata entity whose P2333 exactly equals the requested Norwegian organisation number. P856 is recorded as a candidate, never as a published company fact. The candidate page must still pass the existing HTTPS, public-address, robots, redirect, and page-identity checks before the agent publishes website facts or follows any same-host job/activity links. Directory and social-network domains are rejected. Each request and lookup failure is included in the run report; a failed discovery is not silently described as a successful empty search.
+
+The full local test suite passes 78 tests, including four new Wikidata connector tests and the site-name/organisation-number cases. **No live coverage gain is claimed yet.** The test environment could not resolve `query.wikidata.org`, so the connector has not been measured on the supplied 100 companies. A live 100-company rerun with `--wikidata-websites`, followed by manual review of newly found sites and false-positive checks, is the next required measurement. The website discovery is included as an opt-in until that run succeeds.
+
+The attached starter kit supports a broader lawful search-provider path, but its Brave connector requires a separately provisioned API key and explicit result-retention terms. No key was supplied, and its output cannot be measured here; it is not enabled or represented as a completed coverage improvement.
+
 ## Changes made
 
 - Added an opt-in `--nav-jobs` batch lookup using NAV's public feed. It only processes profiles whose BRREG identity is verified, starts with recent changes, limits the scan to three pages and 100 job details, rechecks each ad's active status and expiry, and requires an exact employer organisation number or a strict company-name plus location/homepage match. It rejects cross-host redirects and counts shared requests.

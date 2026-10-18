@@ -10,6 +10,14 @@ Requires Python 3.10 or newer. The program uses only the Python standard library
 python signalpost_agent.py --input smoke_100.json --output outputs/smoke-100-final.jsonl --state outputs/smoke-100-final.sqlite3 --timeout 2 --workers 4
 ```
 
+For the best no-key website discovery, add `--wikidata-websites`. This makes one
+batched Wikidata lookup per 50 verified company numbers that lack a BRREG website.
+Wikidata's exact Norwegian organisation-number match is only a lead: the candidate
+homepage must still pass this agent's HTTPS, public-address, robots, and exact
+company-identity checks before facts are published. The option uses no paid API.
+If Wikidata is unreachable, the run records a discovery failure and still emits one
+result envelope per input.
+
 To add NAV's opt-in public vacancy feed, append `--nav-jobs`. The NAV scan is bounded to recent feed updates and a fixed page/detail budget; it can report truncation and is not a complete jobs index. It makes no paid API calls.
 
 Replace the example input with Builderr's supplied JSON or JSONL batch. `--workers` accepts 1–16 and defaults to four. The command also writes a JSON run report and an HTML profile browser beside the output. SQLite stores source hashes and prior snapshots so repeated content is idempotent and source changes remain visible.
@@ -32,10 +40,10 @@ Each published fact points to a content-hashed source snapshot and includes a re
 
 ```powershell
 python -m unittest discover -s . -p 'test_*.py' -v
-python -m py_compile signalpost_agent.py claim_judge.py test_signalpost_agent.py test_input_stages.py test_claim_judge.py test_qa_regressions.py
+python -m py_compile signalpost_agent.py nav_jobs.py wikidata_websites.py claim_judge.py test_signalpost_agent.py test_input_stages.py test_claim_judge.py test_qa_regressions.py test_wikidata_websites.py
 ```
 
-The local suite passes 71 tests, including RSS/Atom evidence and NAV entity checks. The final live 100-company run returned 100 complete profiles in 108.7 seconds with 322 requests; 99 finance lookups returned data and one returned HTTP 500. It found 1 jobs profile and 1 public-activity profile; the latter contains 10 dated items from a registered company's own feed and passed the evidence-integrity gate. NAV added zero matches and hit its configured page cap. Compared with the earlier 100-company run, public activity increased from zero to one available profile; jobs coverage did not change. See [the coverage-improvement report](COVERAGE_IMPROVEMENTS.md) and [the independent QA report](QA_TEST_REPORT.md) for exact results. The Builderr starter kit's refresh replay passed locally with 2/2 expected changes, 0 false positives, 0 false negatives and an idempotent rerun. Its broader test suite could not be run here because the optional `extruct` dependency is not installed.
+The local suite passes 78 tests, including RSS/Atom evidence, NAV entity checks, conservative full-page company-name matching, and exact-ID Wikidata discovery fixtures. The recorded live 100-company run returned 100 complete profiles in 108.7 seconds with 322 requests; 99 finance lookups returned data and one returned HTTP 500. It found 1 jobs profile and 1 public-activity profile; the latter contains 10 dated items from a registered company's own feed and passed the evidence-integrity gate. NAV added zero matches and hit its configured page cap. Wikidata discovery has not been live-verified in this environment because DNS resolution for external sites failed; do not count it as measured coverage yet. See [the coverage-improvement report](COVERAGE_IMPROVEMENTS.md) and [the independent QA report](QA_TEST_REPORT.md) for exact results.
 
 ## Readiness
 

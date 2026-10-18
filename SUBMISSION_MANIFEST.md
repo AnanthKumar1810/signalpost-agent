@@ -3,13 +3,14 @@
 Prepared: 18 October 2026
 
 - Repository: https://github.com/AnanthKumar1810/signalpost-agent
-- Tested source revision: `82d9ceb748ffeff3c5f8b22dd740fa017f204f2e` (the full source revision used for the recorded smoke run). The project documentation and submission bundle are prepared from that source tree; see the delivery ZIP manifest for its exact package contents.
+- Historical live smoke-run source revision: `82d9ceb748ffeff3c5f8b22dd740fa017f204f2e`. The recorded live measurements below belong to that run. Subsequent source changes are tested offline; they have not been included in a new live 100-company run.
 - One-command run from a clean checkout (Python 3.10+; standard library only):
   `python signalpost_agent.py --input smoke_100.json --output outputs/profiles.jsonl --state outputs/state.sqlite3 --timeout 12 --workers 4`
 - Reproduce the recorded 100-company smoke run:
   `python signalpost_agent.py --input smoke_100.json --output outputs/live-100-coverage-final.jsonl --state outputs/live-100-coverage-final.sqlite3 --timeout 5 --workers 4`
 - Recorded run: 100 input companies; 100 output envelopes; 100 verified identities; 322 outbound requests; 108,675 ms wall time with four workers; 4 reported errors. Finance returned data for 99 companies and one lookup ended in HTTP 500 after retry. Jobs and public activity each had 1 available, 96 not available, and 3 failed. Paid-provider spend was USD 0.00. See `outputs/live-100-coverage-final.jsonl.report.json` and the detailed judge report.
 - Model/API details: default mode uses no LLM and no paid search API. It uses BRREG registry, roles and accounts APIs, and conditionally checks the company's BRREG-listed website and its advertised RSS/Atom feeds. Optional NAV job search is available with `--nav-jobs`; the measured capped run found no matches. The optional LLM-assisted candidate search requires an API key; cited pages are fetched and checked before claims can be marked verified. It is not part of the default run.
+- Optional website discovery: `--wikidata-websites` queries Wikidata for an exact Norwegian organisation-number match and treats its website property as a candidate only. The candidate site still has to pass the agent's independent website identity and fetch checks. This path is not live-verified here and must not be included in measured coverage or the measured run command above.
 - Expected external API cost: measured USD 0 for the recorded default run. This excludes local compute and internet service charges. Any optional provider use incurs provider-specific costs that were not measured here.
 - Contact: Sirela Ananth Kumar, `sananthkumar3@gmail.com` (from the participant details provided for this project).
 - Test inputs and outputs: `smoke_100.json`, `smoke_100_sample.json`, and `outputs/live-100-coverage-final.jsonl` with its JSON report and HTML viewer.

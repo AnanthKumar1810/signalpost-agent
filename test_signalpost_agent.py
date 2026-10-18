@@ -223,6 +223,48 @@ class AgentTests(unittest.TestCase):
         web_claim = next(c for c in claims if c[0][0] == "web_presence")
         self.assertEqual(web_claim[0][1], "ambiguous")
 
+    def test_registered_name_in_body_can_verify_but_short_negative_mention_cannot(self):
+        self.assertTrue(sp.legal_name_matches_page(
+            "NORDIC COFFEE ROASTERS AS",
+            "Welcome. Company details: Nordic Coffee Roasters. Org information and contact details.",
+        ))
+        self.assertFalse(sp.legal_name_matches_page(
+            "Example AS", "Another legal entity. This is not Example AS.", "Another legal entity",
+        ))
+        self.assertFalse(sp.legal_name_matches_page(
+            "NORDIC COFFEE ROASTERS AS", "Nordic Coffee Academic Partnership", "Nordic Coffee Academic Partnership",
+        ))
+
+    def test_website_collector_accepts_suffix_free_name_in_page_body(self):
+        class Headers:
+            def get_content_type(self): return "text/html"
+        class Response:
+            headers = Headers()
+            def __init__(self, url, body): self.url, self.body = url, body
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def geturl(self): return self.url
+            def read(self, _limit): return self.body
+        robots = Response("https://example.no/robots.txt", b"User-agent: *\\nAllow: /\\n")
+        homepage = Response(
+            "https://example.no/",
+            b"<title>Nordic Roast</title><p>Company details: Nordic Coffee Roasters.</p>",
+        )
+        env = {"operations": {"requests": 0}, "source_snapshots": [], "evidence": [], "errors": [], "changes": []}
+        claims = []
+        with patch.object(sp, "public_host", return_value=True), patch.object(sp, "open_safe", side_effect=[robots, homepage]):
+            self.agent.website("923609016", "https://example.no", "NORDIC COFFEE ROASTERS AS", env,
+                              lambda family, status, facts=None, reason=None: claims.append({"family": family, "status": status, "facts": facts or [], "reason": reason}))
+        web = next(item for item in claims if item["family"] == "web_presence")
+        self.assertEqual(web["status"], "available")
+        self.assertEqual({fact["field"] for fact in web["facts"]}, {"website_url", "website_title"})
+        self.assertEqual(env["operations"]["requests"], 2)
+
+    def test_formatted_org_number_is_recognized_exactly(self):
+        self.assertTrue(sp.page_has_organisation_number("Org.nr. 923 609 016", "923609016"))
+        self.assertTrue(sp.page_has_organisation_number("Org.nr: 923-609-016", "923609016"))
+        self.assertFalse(sp.page_has_organisation_number("Org.nr. 923 609 017", "923609016"))
+
     def test_private_host_is_rejected(self):
         self.assertFalse(sp.public_host("127.0.0.1"))
         self.assertFalse(sp.public_host("10.0.0.8"))
