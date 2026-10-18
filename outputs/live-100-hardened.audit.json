@@ -1,0 +1,19 @@
+{
+  "input_count": 100,
+  "profile_count": 100,
+  "unique_org_numbers": 100,
+  "all_input_org_numbers_match": true,
+  "verified_identity_profiles": 100,
+  "published_fact_count": 2909,
+  "facts_with_evidence_and_same_company_snapshot": 2909,
+  "audit_issue_count": 0,
+  "audit_issues": [],
+  "fact_counts_by_family": {
+    "company_details": 912,
+    "locations": 392,
+    "people": 295,
+    "financials": 1308,
+    "web_presence": 1,
+    "jobs": 1
+  }
+}
