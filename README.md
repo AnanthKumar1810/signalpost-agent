@@ -32,7 +32,7 @@ The checked-in 100-company input comes from Builderr's public eligible-company u
 
 `--llm-summary` optionally sends a JSON object containing the verified identity anchor, the collected claim fields (`family`, `status`, `facts`, `reason`), and explicit changes to the configured OpenAI model. It does not send raw pages, search results, or evidence excerpts. The model receives the plain-text summary prompt in `llm_summary.py`; output is rejected when it is not plain prose, has the wrong sentence count, omits the missing-category sentence, or contains an unsupported number. Rejected or failed output leaves the deterministic evidence-based summary in place. Calls require `OPENAI_API_KEY` and are never made in the default run. Text meaning cannot be fully proven by format checks, so review provenance in the retained local fact map before relying on a generated summary. API usage is reported from provider token counts when available; it is an estimate, not a billing statement.
 
-The [sample dashboard](https://ananthkumar1810.github.io/signalpost-agent/) is a frozen, mobile-responsive browser view of the October 19 practice sample. It is not live company data or an official competition score.
+The frozen, mobile-responsive sample dashboard is in [`docs/index.html`](docs/index.html). It shows the October 19 practice sample, not live company data or an official competition score. To publish it, enable **Settings → Pages → Build and deployment → GitHub Actions** for this repository. The workflow skips cleanly until that setting is enabled; after a successful run the site will appear at [ananthkumar1810.github.io/signalpost-agent](https://ananthkumar1810.github.io/signalpost-agent/).
 
 ## Evidence and source policy
 
