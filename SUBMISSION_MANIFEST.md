@@ -1,24 +1,23 @@
 # Submission manifest
 
-Prepared: 18 October 2026
+Prepared: 19 October 2026
 
 - Repository: https://github.com/AnanthKumar1810/signalpost-agent
-- Historical live smoke-run source revision: `82d9ceb748ffeff3c5f8b22dd740fa017f204f2e`. The recorded live measurements below belong to that run. Subsequent source changes are tested offline; they have not been included in a new live 100-company run.
+- Submission source revision: to be filled with the pushed commit hash after final verification. The original baseline and the 19 October live measurements are identified separately in the judge report; never attribute old measurements to a newer revision.
 - One-command run from a clean checkout (Python 3.10+; standard library only):
-  `python signalpost_agent.py --input smoke_100.json --output outputs/profiles.jsonl --state outputs/state.sqlite3 --timeout 12 --workers 4`
-- Reproduce the recorded 100-company smoke run:
-  `python signalpost_agent.py --input smoke_100.json --output outputs/live-100-coverage-final.jsonl --state outputs/live-100-coverage-final.sqlite3 --timeout 5 --workers 4`
-- Recorded run: 100 input companies; 100 output envelopes; 100 verified identities; 322 outbound requests; 108,675 ms wall time with four workers; 4 reported errors. Finance returned data for 99 companies and one lookup ended in HTTP 500 after retry. Jobs and public activity each had 1 available, 96 not available, and 3 failed. Paid-provider spend was USD 0.00. See `outputs/live-100-coverage-final.jsonl.report.json` and the detailed judge report.
-- Model/API details: default mode uses no LLM and no paid search API. It uses BRREG registry, roles and accounts APIs, and conditionally checks the company's BRREG-listed website and its advertised RSS/Atom feeds. Optional NAV job search is available with `--nav-jobs`; the measured capped run found no matches. The optional LLM-assisted candidate search requires an API key; cited pages are fetched and checked before claims can be marked verified. It is not part of the default run.
-- Optional website discovery: `--wikidata-websites` queries Wikidata for an exact Norwegian organisation-number match and treats its website property as a candidate only. The candidate site still has to pass the agent's independent website identity and fetch checks. This path is not live-verified here and must not be included in measured coverage or the measured run command above.
-- Expected external API cost: measured USD 0 for the recorded default run. This excludes local compute and internet service charges. Any optional provider use incurs provider-specific costs that were not measured here.
+  `python signalpost_agent.py --input smoke_100.json --output outputs/profiles.jsonl --state outputs/state.sqlite3 --timeout 12 --workers 4 --nav-jobs --wikidata-websites`
+- Reproduce the recorded final combined 100-company smoke run:
+  `python signalpost_agent.py --input smoke_100.json --output outputs/live-100-combined-final.jsonl --state outputs/live-100-combined-final.sqlite3 --timeout 8 --workers 4 --nav-jobs --wikidata-websites`
+- Final combined run: 100 input and output profiles, 100 verified identities, 348 outbound requests (28 NAV requests and 2 Wikidata queries), 177,328 ms wall time using four workers, 4 source errors, and USD 0 paid API cost. Website presence was 1 available / 92 not available / 4 ambiguous / 3 failed. Jobs and public activity each were 1 available / 96 not available / 3 failed. NAV found two employer candidates and matched zero companies; Wikidata checked 92 website-less profiles and returned zero candidates. A structural audit of 2,923 facts found no missing evidence IDs, missing snapshots, wrong-company snapshots or evidence-integrity errors. These figures do not establish fact truth or score coverage. The detailed judge report and `outputs/live-100-combined-final.jsonl.report.json` provide run details.
+- Model/API details: no LLM or paid search API is used in the recommended run. The agent uses BRREG registry, roles and accounts APIs; it checks a company's registered/verified website, advertised RSS/Atom feeds and same-site pages; it checks public Greenhouse, Lever or Ashby jobs only when that website explicitly links to the board. NAV is bounded to a 180-day update window, 25 feed pages and 100 details by default. Wikidata's exact organisation-number match provides only an untrusted website candidate; every candidate site must pass the independent identity and fetch checks. Optional LLM-assisted search remains candidate-only until cited pages are fetched and claims verified; it is not in the recommended command.
+- Expected external API cost: the measured combined public-source run spent USD 0 on paid APIs. This excludes local compute and internet service charges. Optional LLM/search-provider use has separate cost and is not included.
 - Contact: Sirela Ananth Kumar, `sananthkumar3@gmail.com` (from the participant details provided for this project).
-- Test inputs and outputs: `smoke_100.json`, `smoke_100_sample.json`, and `outputs/live-100-coverage-final.jsonl` with its JSON report and HTML viewer.
+- Test inputs and outputs: `smoke_100.json`, `smoke_100_sample.json`, and `outputs/live-100-combined-final.jsonl` with its JSON report and HTML profile browser.
 - Source and reuse: BRREG open data is published under NLOD 2.0. The accounts service is described as a preview and may be incomplete or unavailable. Third-party websites remain subject to their access rules and robots policies. Restricted social platforms are not scraped.
 - Official submission status: prepared for the participant to submit. No competition email or official submission has been sent. The official score and qualification can only be determined by Builderr's evaluation.
 
 ## Profile-count requirement
 
-Builderr's current detailed “What to submit” instructions request a 100-company smoke-test report with one complete result per input. They also say Builderr provides the companies for official evaluations and precomputed company profiles or a company manifest are not needed for ranking. The public page also contains a shorter “Submit 1,000+ profiles” line, so the page is internally inconsistent. This bundle includes the explicitly detailed 100-company smoke test and the reusable agent; it does not claim that the 100 smoke profiles are a 1,000-profile dataset. Confirm the requirement with Builderr before relying on the shorter banner line.
+Builderr's current detailed “What to submit” instructions request a 100-company smoke-test report with one complete result per input. The page advertises running tests at 1,000+ profiles, and says Builderr supplies the companies for official evaluations; precomputed profiles are not needed for ranking. The bundle includes the reusable agent and the required 100-company smoke test; it does not claim that this smoke sample is a 1,000-profile data set.
 
 Official rules: https://builderr.ai/challenges/signalpost

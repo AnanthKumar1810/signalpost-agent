@@ -43,6 +43,7 @@ class NavJobFeedTests(unittest.TestCase):
         self.assertEqual(job["status"], "available")
         self.assertEqual(job["facts"][0]["value"]["title"], "Engineer")
         self.assertEqual(job["facts"][0]["_nav_url"], "https://pam-stilling-feed.nav.no/api/v1/feedentry/ad-1")
+        self.assertEqual(report["lookback_days"], 180)
 
     def test_rejects_stale_ad_even_when_feed_header_says_active(self):
         detail = {"status": "INACTIVE", "ad_content": {"title": "Engineer"}}

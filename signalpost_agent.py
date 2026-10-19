@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 from urllib.robotparser import RobotFileParser
 from nav_jobs import NavJobFeed
+from public_ats import fetch_linked_jobs
 from wikidata_websites import WikidataWebsiteDiscovery
 
 BRREG = "https://data.brreg.no/enhetsregisteret/api"
@@ -93,6 +94,13 @@ def legal_name_matches_page(legal_name: str, page_text: str, identity_heading: s
     # substantive words. A short name must appear in the identity heading or be
     # corroborated by the exact organisation number.
     distinctive = name_tokens[:-1] if name_tokens[-1] in _LEGAL_FORM_SUFFIXES else name_tokens
+    if len(distinctive) == 1 and len(distinctive[0]) >= 4:
+        if heading_tokens == distinctive:
+            return True
+        # For short, single-word brands, require two exact whole-word mentions
+        # on the already registry-linked/identifier-discovered site.
+        occurrences = sum(1 for token in page_tokens if token == distinctive[0])
+        return occurrences >= 2
     if len(distinctive) < 2 or not all(len(token) >= 3 for token in distinctive):
         return False
     candidates = [name_tokens]
@@ -117,6 +125,31 @@ def page_has_organisation_number(page_text: str, organisation_number: str) -> bo
         if re.sub(r"\D", "", candidate) == expected:
             return True
     return False
+
+
+def official_profile_links(links: list[tuple[str, str]]) -> list[dict[str, str]]:
+    """Expose social/profile URLs only when linked by the verified company site; never crawl them."""
+    platforms = {
+        "linkedin.com": "LinkedIn", "facebook.com": "Facebook", "instagram.com": "Instagram",
+        "x.com": "X", "twitter.com": "X", "youtube.com": "YouTube", "tiktok.com": "TikTok",
+    }
+    results: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for href, _caption in links:
+        try:
+            parsed = urllib.parse.urlsplit(href)
+            host = (parsed.hostname or "").lower().rstrip(".")
+            platform = next((label for domain, label in platforms.items() if host == domain or host.endswith("." + domain)), None)
+            if (parsed.scheme != "https" or parsed.username or parsed.password or parsed.port not in (None, 443)
+                    or not platform or len([part for part in parsed.path.split("/") if part]) < 1):
+                continue
+            url = urllib.parse.urlunsplit(("https", parsed.netloc, parsed.path, "", ""))
+            if url not in seen:
+                seen.add(url)
+                results.append({"platform": platform, "url": url})
+        except ValueError:
+            continue
+    return results[:12]
 
 
 def _iso_date(value: Any) -> str | None:
@@ -596,17 +629,21 @@ class Agent:
             snap=self.snapshot(org,"website",url,body,{"title":title,"text":page_text[:8000]})
             env["source_snapshots"].append(snap)
             if snap["changed"]: env["changes"].append({"family":"web_presence","source_id":snap["id"],"previous_sha256":snap["previous_sha256"],"sha256":snap["sha256"],"changed_fields":snap["changed_fields"]})
-            ev={"id":snap["id"],"source_id":snap["id"],"excerpt":(title+" — "+page_text[:500])[:600],"claim_fields":["website_url","website_title","website_description"]}
+            profile_links = official_profile_links(p.links)
+            profile_excerpt = " Company-site profile links: " + ", ".join(item["url"] for item in profile_links) if profile_links else ""
+            ev={"id":snap["id"],"source_id":snap["id"],"excerpt":(title+" — "+page_text[:380]+profile_excerpt)[:600],"claim_fields":["website_url","website_title","website_description","company_profile_url"]}
             env["evidence"].append(ev)
             if name_match or org_match:
                 facts=[{"field":"website_url","value":url,"evidence_ids":[snap["id"]],"observed_at":snap["retrieved_at"],"valid_at":None},
                        {"field":"website_title","value":title or urllib.parse.urlparse(url).hostname,"evidence_ids":[snap["id"]],"observed_at":snap["retrieved_at"],"valid_at":None}]
                 if p.meta_description: facts.append({"field":"website_description","value":p.meta_description,"evidence_ids":[snap["id"]],"observed_at":snap["retrieved_at"],"valid_at":None})
+                facts.extend({"field":"company_profile_url","value":profile_link,"evidence_ids":[snap["id"]],"observed_at":snap["retrieved_at"],"valid_at":None} for profile_link in profile_links)
                 claim("web_presence","available",facts)
                 job_pages=[]
+                ats_links=[href for href,_caption in p.links]
                 for href,caption in p.links:
                     full=urllib.parse.urlparse(href)
-                    if full.hostname==parsed.hostname and full.scheme=="https" and re.search(r"vacan|job|position|stilling|ledig",full.path+" "+caption,re.I):
+                    if full.hostname==parsed.hostname and full.scheme=="https" and re.search(r"vacan|job|career|position|stilling|ledig",full.path+" "+caption,re.I):
                         job_pages.append(urllib.parse.urlunparse((full.scheme,full.netloc,full.path,"","","")))
                 job_facts=[]
                 for job_url in list(dict.fromkeys(job_pages))[:2]:
@@ -623,6 +660,7 @@ class Agent:
                             continue
                     job_text=job_body.decode("utf-8",errors="replace")
                     job_parser=PageParser(job_url); job_parser.feed(job_text)
+                    ats_links.extend(href for href,_caption in job_parser.links)
                     job_title=" ".join(job_parser.h1).strip() or " ".join(job_parser.title).strip()
                     job_words=" ".join(job_parser.text)
                     accepting=bool(re.search(r"apply(?: now)?|submit (?:your )?application|søk(?: nå| på stillingen)?",job_words,re.I))
@@ -633,6 +671,44 @@ class Agent:
                         if job_snap["changed"]: env["changes"].append({"family":"jobs","source_id":job_snap["id"],"previous_sha256":job_snap["previous_sha256"],"sha256":job_snap["sha256"],"changed_fields":job_snap["changed_fields"]})
                         env["evidence"].append({"id":job_snap["id"],"source_id":job_snap["id"],"excerpt":(job_title+" — "+job_words[:500])[:600],"claim_fields":["active_job_title"]})
                         job_facts.append({"field":"active_job_title","value":job_title,"evidence_ids":[job_snap["id"]],"observed_at":job_snap["retrieved_at"],"valid_at":None,"source_url":job_url})
+                # Follow only public ATS boards explicitly linked from the company
+                # page already verified against this legal entity. The two-source
+                # evidence chain preserves that relationship and the current listing.
+                def fetch_ats_json(api_url: str) -> tuple[Any, bytes, int]:
+                    api_host = urllib.parse.urlparse(api_url).hostname or ""
+                    env["operations"]["requests"] += 1
+                    return get_json(api_url, self.timeout, on_retry=count_retry)
+                ats = fetch_linked_jobs(ats_links, fetch_ats_json)
+                for ats_error in ats["errors"]:
+                    env["errors"].append({"type": "public_ats_error", **ats_error})
+                if ats["jobs"]:
+                    board_links = list(dict.fromkeys(job["board_url"] for job in ats["jobs"]))
+                    link_snap = self.snapshot(org, "jobs", url, body, {"linked_public_ats_boards": board_links})
+                    env["source_snapshots"].append(link_snap)
+                    env["evidence"].append({"id": link_snap["id"], "source_id": link_snap["id"],
+                                            "excerpt": "Verified company website explicitly links to public job board(s): " + ", ".join(board_links),
+                                            "claim_fields": ["active_job"]})
+                    response_snapshots: dict[tuple[str, str], str] = {}
+                    for response_data in ats["responses"]:
+                        response_snap = self.snapshot(org, "jobs", response_data["url"], response_data["raw"],
+                                                      {"provider": response_data["board"]["provider"], "job_count": len(response_data["jobs"])})
+                        env["source_snapshots"].append(response_snap)
+                        response_snapshots[(response_data["board"]["provider"], response_data["board"]["link"])] = response_snap["id"]
+                        if response_snap["changed"]:
+                            env["changes"].append({"family": "jobs", "source_id": response_snap["id"],
+                                                   "previous_sha256": response_snap["previous_sha256"], "sha256": response_snap["sha256"],
+                                                   "changed_fields": response_snap["changed_fields"]})
+                    for job in ats["jobs"]:
+                        api_evidence_id = response_snapshots.get((job["provider"], job["board_url"]))
+                        if not api_evidence_id:
+                            continue
+                        env["evidence"].append({"id": api_evidence_id, "source_id": api_evidence_id,
+                                                "excerpt": f"Published {job['provider']} listing: {job['title']}" + (f" — {job['location']}" if job["location"] else ""),
+                                                "claim_fields": ["active_job"]})
+                        job_value = {key: job.get(key) for key in ("title", "location", "url", "published_at", "source_updated_at", "provider") if job.get(key)}
+                        job_facts.append({"field": "active_job", "value": job_value,
+                                          "evidence_ids": [link_snap["id"], api_evidence_id],
+                                          "observed_at": now(), "valid_at": _iso_date(job.get("published_at"))})
                 claim("jobs","available" if job_facts else "not_available",job_facts,None if job_facts else "No current vacancy with an application action was verified")
                 activity_pages = [url]
                 for href, caption in p.links:
@@ -660,8 +736,8 @@ class Agent:
                         activity_parser.feed(activity_body.decode("utf-8", errors="replace"))
                     activity_heading = " ".join(activity_parser.title + activity_parser.h1)
                     activity_text = " ".join(activity_parser.text)
-                    exact_name = bool(legal_name and re.search(r"(?<![\w])" + re.escape(legal_name) + r"(?![\w])", activity_heading + " " + activity_text, re.I))
-                    exact_org = bool(re.search(r"(?<![0-9])" + re.escape(org) + r"(?![0-9])", activity_text))
+                    exact_name = legal_name_matches_page(legal_name, activity_text, activity_heading)
+                    exact_org = page_has_organisation_number(activity_text, org)
                     if not (exact_name or exact_org):
                         continue
                     published = next((value[:10] for value in activity_parser.published_dates if _iso_date(value[:10])), None)
@@ -837,16 +913,97 @@ class Agent:
         industry = fields.get("industry_description", {}).get("value")
         form = anchor.get("organisation_form")
         city = fields.get("city", {}).get("value")
-        clauses = [f"{name} is registered in Norway"]
-        if form: clauses[0] += f" as {form}"
-        if industry: clauses.append(f"its registered industry is {industry}")
-        if city: clauses.append(f"its registered business address is in {city}")
-        if fields.get("bankruptcy", {}).get("value") is True: clauses.append("the registry marks it as bankrupt")
-        if fields.get("under_liquidation", {}).get("value") is True: clauses.append("the registry marks it as under liquidation")
-        if fields.get("under_forced_liquidation", {}).get("value") is True: clauses.append("the registry marks it as under forced liquidation or dissolution")
-        evidence_ids = sorted({eid for fact in details for eid in fact.get("evidence_ids", [])})
-        unknowns = [family for family in ("financials", "jobs", "public_activity") if by_family.get(family, {}).get("status") != "available"]
-        return {"text": "; ".join(clauses) + ".", "evidence_ids": evidence_ids, "unknown_families": unknowns, "method": "deterministic evidence-grounded summary"}
+        clauses = [f"{name} is registered in Norway" + (f" as {form}" if form else "") + "."]
+        evidence_ids: set[str] = set()
+        def cite(fact: dict[str, Any] | None) -> None:
+            if fact:
+                evidence_ids.update(eid for eid in fact.get("evidence_ids", []) if isinstance(eid, str))
+        for fact in details:
+            cite(fact)
+        if industry:
+            clauses.append(f"BRREG classifies its registered activity as {industry}.")
+        if city:
+            clauses.append(f"Its registered business location is {city}.")
+        employees = fields.get("employee_count")
+        if employees and isinstance(employees.get("value"), int) and not isinstance(employees.get("value"), bool):
+            clauses.append(f"BRREG reports {employees['value']} registered employees.")
+            cite(employees)
+        if fields.get("bankruptcy", {}).get("value") is True:
+            clauses.append("The registry marks it as bankrupt.")
+        if fields.get("under_liquidation", {}).get("value") is True:
+            clauses.append("The registry marks it as under liquidation.")
+        if fields.get("under_forced_liquidation", {}).get("value") is True:
+            clauses.append("The registry marks it as under forced liquidation or dissolution.")
+
+        web_facts = by_family.get("web_presence", {}).get("facts", [])
+        website_title = next((fact for fact in web_facts if fact.get("field") == "website_title"), None)
+        if website_title and isinstance(website_title.get("value"), str):
+            clauses.append(f"The verified website page title is {website_title['value']}.")
+            cite(website_title)
+        company_profiles = [fact for fact in web_facts if fact.get("field") == "company_profile_url"
+                            and isinstance(fact.get("value"), dict) and fact["value"].get("platform")]
+        if company_profiles:
+            platforms = sorted({fact["value"]["platform"] for fact in company_profiles})
+            clauses.append("The verified company website links to public profiles on " + ", ".join(platforms) + ".")
+            for fact in company_profiles:
+                cite(fact)
+
+        role_facts = by_family.get("people", {}).get("facts", [])
+        leaders = [fact for fact in role_facts if isinstance(fact.get("value"), dict)
+                   and re.search(r"director|manager|chair|leder|daglig|styreleder", str(fact["value"].get("role") or ""), re.I)
+                   and fact["value"].get("name")]
+        if leaders:
+            selected_leaders = leaders[:3]
+            clauses.append("BRREG lists registered leadership roles: " + "; ".join(
+                f"{fact['value'].get('role')}: {fact['value']['name']}" for fact in selected_leaders) + ".")
+            for fact in selected_leaders:
+                cite(fact)
+
+        financial_facts = by_family.get("financials", {}).get("facts", [])
+        periods = [fact for fact in financial_facts if isinstance(fact.get("valid_at"), str)]
+        latest_period = max((fact.get("valid_at") for fact in periods), default=None)
+        if latest_period:
+            key_figures = {fact.get("field"): fact for fact in periods if fact.get("valid_at") == latest_period}
+            parts = []
+            for field, label in (("revenue_nok", "revenue"), ("operating_result_nok", "operating result"), ("net_result_nok", "net result")):
+                fact = key_figures.get(field)
+                if fact and isinstance(fact.get("value"), (int, float)) and not isinstance(fact.get("value"), bool):
+                    parts.append(f"{label} NOK {fact['value']:,.0f}")
+                    cite(fact)
+            if parts:
+                clauses.append(f"The latest available annual accounts end {latest_period}: " + ", ".join(parts) + ".")
+
+        activity = by_family.get("public_activity", {}).get("facts", [])
+        dated_activity = [fact for fact in activity if isinstance(fact.get("value"), dict)
+                          and isinstance(fact["value"].get("published_at"), str)]
+        if dated_activity:
+            latest_activity = max(dated_activity, key=lambda fact: fact["value"]["published_at"])
+            value = latest_activity["value"]
+            clauses.append(f"Latest verified public activity: {value.get('title', 'dated company update')} ({value['published_at']}).")
+            cite(latest_activity)
+
+        jobs = by_family.get("jobs", {}).get("facts", [])
+        job_titles = []
+        for fact in jobs:
+            value = fact.get("value")
+            title = value.get("title") if isinstance(value, dict) else value
+            if isinstance(title, str) and title.strip():
+                job_titles.append(title.strip())
+                cite(fact)
+        if job_titles:
+            clauses.append("Verified current vacancies include " + ", ".join(dict.fromkeys(job_titles[:3])) + ".")
+
+        changes = env.get("changes", [])
+        changed_families = sorted({item.get("family") for item in changes if isinstance(item, dict) and item.get("family")})
+        if changed_families:
+            clauses.append("This refresh detected source changes in " + ", ".join(changed_families) + "; see the change log and dated evidence.")
+
+        unknowns = [family for family in FAMILIES if by_family.get(family, {}).get("status") not in {"available", "not_applicable"}]
+        if unknowns:
+            labels = ", ".join(family.replace("_", " ") for family in unknowns)
+            clauses.append("No verified result is available for: " + labels + ". These gaps may reflect missing, blocked, or inaccessible sources, not proof that the information does not exist.")
+        return {"text": " ".join(clauses), "evidence_ids": sorted(evidence_ids), "unknown_families": unknowns,
+                "method": "deterministic evidence-grounded profile synthesis"}
 
 
 def load_orgs(path: Path) -> list[str]:
@@ -922,9 +1079,9 @@ def make_dashboard(jsonl_path: Path) -> Path:
     embedded=json.dumps(rows,ensure_ascii=False).replace("<","\\u003c").replace(">","\\u003e").replace("&","\\u0026")
     page='''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Signalpost company profiles</title>
 <style>
-:root{font:16px/1.45 system-ui,sans-serif;color:#17232b;background:#f4f7f7}body{margin:0}header{background:#123c44;color:white;padding:1.2rem max(1rem,calc((100vw - 1100px)/2))}main{max-width:1100px;margin:1rem auto;padding:0 1rem}.bar{display:flex;gap:.7rem;align-items:center;flex-wrap:wrap}.bar input{flex:1;min-width:14rem;padding:.8rem;border:1px solid #aab8ba;border-radius:.5rem;font:inherit}.layout{display:grid;grid-template-columns:minmax(16rem, .8fr) minmax(0,1.5fr);gap:1rem;margin-top:1rem}.list,.detail{background:white;border:1px solid #d8e0e1;border-radius:.6rem;padding:.8rem}.company{display:block;width:100%;text-align:left;background:white;border:0;border-bottom:1px solid #e5ebeb;padding:.75rem .5rem;font:inherit;cursor:pointer}.company:hover,.company:focus{background:#edf6f5}.muted{color:#58686c;font-size:.9rem}.pill{display:inline-block;border-radius:99px;padding:.1rem .5rem;background:#e5efed;font-size:.8rem}.claim{border-top:1px solid #e5ebeb;padding:.65rem 0}.claim h3{margin:.2rem 0;font-size:1rem}.fact{margin:.35rem 0}.source{font-size:.85rem}.empty{padding:1rem;color:#58686c}@media(max-width:700px){.layout{grid-template-columns:1fr}.list{max-height:35vh;overflow:auto}}
-</style><header><h1>Signalpost company profiles</h1><div>Evidence-backed facts from the supplied company batch</div></header><main><div class="bar"><input id="q" type="search" placeholder="Search by company name or organisation number" aria-label="Search companies"><span id="count" class="muted"></span></div><div class="layout"><nav id="companies" class="list" aria-label="Companies"></nav><section id="profile" class="detail" aria-live="polite"><p class="empty">Choose a company to inspect its facts and sources.</p></section></div></main>
-<script>const rows=JSON.parse('''+json.dumps(embedded)+''');const list=document.querySelector('#companies'),panel=document.querySelector('#profile'),query=document.querySelector('#q'),count=document.querySelector('#count');function el(tag,text,cls){const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n}function show(row){panel.replaceChildren();const id=row.identity_anchor||{};panel.append(el('h2',id.legal_name||row.organisation_number));panel.append(el('div','Org. no. '+row.organisation_number+' · '+(id.status||'unknown'),'muted'));if(row.summary?.text)panel.append(el('p',row.summary.text));for(const c of (row.claims||[])){const section=el('article',undefined,'claim');section.append(el('h3',c.family.replaceAll('_',' ')+' · '+c.status));if(c.reason)section.append(el('p',c.reason,'muted'));for(const f of (c.facts||[])){const value=typeof f.value==='object'?JSON.stringify(f.value):String(f.value);section.append(el('p',(f.field||'fact')+': '+value,'fact'));const ev=(f.evidence_ids||[]).map(x=>(row.source_snapshots||[]).find(s=>s.id===x)).filter(Boolean);for(const s of ev){const a=el('a',s.url,'source');a.href=s.url;a.target='_blank';a.rel='noopener noreferrer';section.append(a,el('span',' · retrieved '+s.retrieved_at,'muted'))}}panel.append(section)}if(row.errors?.length){panel.append(el('h3','Retrieval errors'));for(const e of row.errors)panel.append(el('p',(e.type||'error')+': '+(e.message||''),'muted'))}}function render(){list.replaceChildren();const q=query.value.toLowerCase();const found=rows.filter(r=>((r.identity_anchor?.legal_name||'')+' '+r.organisation_number).toLowerCase().includes(q));count.textContent=found.length+' of '+rows.length+' companies';for(const r of found){const b=el('button',undefined,'company');b.type='button';b.append(el('strong',r.identity_anchor?.legal_name||r.organisation_number),el('div',r.organisation_number+' · '+(r.identity_anchor?.status||'unknown'),'muted'));b.onclick=()=>show(r);list.append(b)}}query.addEventListener('input',render);render();</script></html>'''
+:root{font:16px/1.5 system-ui,sans-serif;color:#17232b;background:#f3f6f5}body{margin:0}header{background:#123c44;color:white;padding:1.2rem max(1rem,calc((100vw - 1200px)/2))}main{max-width:1200px;margin:1rem auto;padding:0 1rem}.bar{display:flex;gap:.65rem;align-items:center;flex-wrap:wrap}.bar input,.bar select,.bar button{padding:.68rem;border:1px solid #aab8ba;border-radius:.5rem;background:white;font:inherit}.bar input{flex:1;min-width:14rem}.bar button{cursor:pointer}.layout{display:grid;grid-template-columns:minmax(17rem,.8fr) minmax(0,1.5fr);gap:1rem;margin-top:1rem}.list,.detail{background:white;border:1px solid #d8e0e1;border-radius:.7rem;padding:.85rem}.list{max-height:78vh;overflow:auto}.companyrow{display:grid;grid-template-columns:auto 1fr;align-items:center;gap:.4rem;border-bottom:1px solid #e5ebeb;padding:.5rem 0}.company{display:block;width:100%;text-align:left;background:white;border:0;padding:.3rem;font:inherit;cursor:pointer;overflow-wrap:anywhere}.company:hover,.company:focus{background:#edf6f5;outline:2px solid #367b70}.muted{color:#58686c;font-size:.9rem}.status{display:inline-block;border-radius:99px;padding:.1rem .5rem;background:#e5efed;font-size:.8rem}.claim{border-top:1px solid #e5ebeb;padding:.65rem 0}.claim h3{margin:.2rem 0;font-size:1rem;text-transform:capitalize}.fact{margin:.35rem 0;overflow-wrap:anywhere}.source{font-size:.85rem;overflow-wrap:anywhere}.empty{padding:1rem;color:#58686c}.tablewrap{overflow-x:auto}.compare{border-collapse:collapse;min-width:600px;width:100%}.compare th,.compare td{padding:.55rem;text-align:left;vertical-align:top;border-bottom:1px solid #d8e0e1}.compare th:first-child{position:sticky;left:0;background:#f3f6f5}.summary{background:#edf6f5;border-left:4px solid #367b70;padding:.8rem;border-radius:.25rem}@media(max-width:720px){.layout{grid-template-columns:1fr}.list{max-height:36vh}.bar input{min-width:100%}.bar select{flex:1}.detail{padding:.7rem}}
+</style><header><h1>Signalpost company profiles</h1><div>Search, compare and verify evidence for this company batch</div></header><main><p id="overview" class="summary" aria-live="polite"></p><div class="bar"><input id="q" type="search" placeholder="Search company name or organisation number" aria-label="Search companies"><select id="state" aria-label="Filter by result status"><option value="all">All profiles</option><option value="available">Has verified findings</option><option value="gaps">Has unavailable information</option><option value="errors">Has source or processing errors</option></select><select id="sort" aria-label="Sort companies"><option value="name">Sort by company name</option><option value="coverage">Sort by available categories</option></select><button id="compare" type="button">Compare selected</button><button id="clear" type="button">Clear selection</button><span id="count" class="muted"></span></div><div class="layout"><nav id="companies" class="list" aria-label="Companies"></nav><section id="profile" class="detail" aria-live="polite"><p class="empty">Choose a company to inspect its facts and evidence. Select up to three companies to compare.</p></section></div></main>
+<script>const rows=JSON.parse('''+json.dumps(embedded)+''');const list=document.querySelector('#companies'),panel=document.querySelector('#profile'),query=document.querySelector('#q'),count=document.querySelector('#count'),state=document.querySelector('#state'),sort=document.querySelector('#sort'),selected=new Set();const dataGroups=[['company_details'],['financials'],['people','locations'],['web_presence'],['jobs','public_activity']];function el(tag,text,cls){const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n}function groupCount(r){return dataGroups.filter(group=>group.some(family=>(r.claims||[]).some(c=>c.family===family&&c.status==='available'))).length}function verifiedCount(r){return (r.claims||[]).filter(c=>c.status==='available').length}document.querySelector('#overview').textContent=rows.length+' company profiles · '+rows.filter(r=>groupCount(r)===5).length+' have verified findings in all five information areas.';function displayValue(v){if(v===null||v===undefined)return '—';if(typeof v==='object')return JSON.stringify(v);return String(v)}function safeLink(value){try{const u=new URL(value);return ['http:','https:'].includes(u.protocol)?u.href:null}catch{return null}}function show(row){panel.replaceChildren();const id=row.identity_anchor||{};panel.append(el('h2',id.legal_name||row.organisation_number));panel.append(el('div','Org. no. '+row.organisation_number+' · '+(id.status||'unknown'),'muted'));if(row.summary?.text)panel.append(el('p',row.summary.text,'summary'));for(const c of (row.claims||[])){const section=el('article',undefined,'claim');section.append(el('h3',c.family.replaceAll('_',' ')+' · '+c.status));if(c.reason)section.append(el('p',c.reason,'muted'));for(const f of (c.facts||[])){section.append(el('p',(f.field||'fact')+': '+displayValue(f.value),'fact'));const ev=(f.evidence_ids||[]).map(x=>(row.source_snapshots||[]).find(s=>s.id===x)).filter(Boolean);for(const s of ev){const href=safeLink(s.url);if(!href)continue;const a=el('a',s.url,'source');a.href=href;a.target='_blank';a.rel='noopener noreferrer';section.append(a,el('span',' · retrieved '+(s.retrieved_at||'date unavailable'),'muted'))}}panel.append(section)}if(row.errors?.length){panel.append(el('h3','Retrieval errors'));for(const e of row.errors)panel.append(el('p',(e.type||'error')+': '+(e.message||''),'muted'))}}function compareRows(){const chosen=rows.filter(r=>selected.has(r.organisation_number)).slice(0,3);panel.replaceChildren();if(chosen.length<2){panel.append(el('p','Select at least two companies, then choose Compare selected.','empty'));return}panel.append(el('h2','Company comparison'));const wrap=el('div',undefined,'tablewrap'),table=el('table',undefined,'compare'),head=el('tr');head.append(el('th','Information'));for(const r of chosen)head.append(el('th',(r.identity_anchor?.legal_name||r.organisation_number)+' · '+r.organisation_number));const thead=el('thead');thead.append(head);table.append(thead);const body=el('tbody');const fields=['summary','company_details','locations','people','financials','web_presence','jobs','public_activity'];for(const family of fields){const tr=el('tr'),label=el('th',family.replaceAll('_',' '));tr.append(label);for(const r of chosen){const td=el('td');if(family==='summary')td.textContent=r.summary?.text||'—';else{const c=(r.claims||[]).find(x=>x.family===family);if(!c)td.textContent='—';else{td.append(el('span',c.status,'status'));for(const f of c.facts||[])td.append(el('p',(f.field||'fact')+': '+displayValue(f.value),'fact'));if(c.reason)td.append(el('div',c.reason,'muted'))}}tr.append(td)}body.append(tr)}table.append(body);wrap.append(table);panel.append(wrap);panel.append(el('p','Select a company from the list to inspect its source links and retrieval dates.','muted'))}function render(){list.replaceChildren();let q=query.value.toLowerCase();let found=rows.filter(r=>{const text=((r.identity_anchor?.legal_name||'')+' '+r.organisation_number).toLowerCase();const has=verifiedCount(r)>0,err=(r.errors||[]).length>0,gap=(r.claims||[]).some(c=>['not_available','blocked','ambiguous','failed'].includes(c.status));return text.includes(q)&&(state.value==='all'||state.value==='available'&&has||state.value==='gaps'&&gap||state.value==='errors'&&err)});found.sort((a,b)=>sort.value==='coverage'?verifiedCount(b)-verifiedCount(a)||String(a.identity_anchor?.legal_name||'').localeCompare(String(b.identity_anchor?.legal_name||'')):String(a.identity_anchor?.legal_name||'').localeCompare(String(b.identity_anchor?.legal_name||'')));count.textContent=found.length+' shown of '+rows.length+' profiles · '+selected.size+' selected';for(const r of found){const row=el('div',undefined,'companyrow'),check=el('input');check.type='checkbox';check.checked=selected.has(r.organisation_number);check.setAttribute('aria-label','Select '+(r.identity_anchor?.legal_name||r.organisation_number));check.onchange=()=>{if(check.checked){if(selected.size>=3){check.checked=false;return}selected.add(r.organisation_number)}else selected.delete(r.organisation_number);render()};const button=el('button',undefined,'company');button.type='button';button.append(el('strong',r.identity_anchor?.legal_name||r.organisation_number),el('div',r.organisation_number+' · '+groupCount(r)+'/5 data areas','muted'));button.onclick=()=>show(r);row.append(check,button);list.append(row)}}query.addEventListener('input',render);state.addEventListener('change',render);sort.addEventListener('change',render);document.querySelector('#compare').onclick=compareRows;document.querySelector('#clear').onclick=()=>{selected.clear();render()};render();</script></html>'''
     destination=jsonl_path.with_suffix(jsonl_path.suffix+".html")
     destination.write_text(page,encoding="utf-8")
     return destination
@@ -939,7 +1096,10 @@ def main() -> int:
     ap.add_argument("--timeout",type=float,default=12)
     ap.add_argument("--workers",type=int,default=4,help="Concurrent company lookups (default: 4)")
     ap.add_argument("--web-search-judge",action="store_true",help="Opt in to one OpenAI web-search call per valid company; results are unverified candidates, never facts")
-    ap.add_argument("--nav-jobs",action="store_true",help="Enable bounded, batch-level lookup through NAV's public job-feed API")
+    ap.add_argument("--nav-jobs",action="store_true",help="Enable a bounded NAV public-job-feed scan over up to six months of active-ad updates")
+    ap.add_argument("--nav-pages",type=int,default=25,help="Maximum NAV feed pages when --nav-jobs is enabled (default: 25; hard cap: 100)")
+    ap.add_argument("--nav-details",type=int,default=100,help="Maximum NAV job details to fetch per batch (default: 100; hard cap: 500)")
+    ap.add_argument("--nav-days",type=int,default=180,help="NAV update lookback in days (default: 180; hard cap: 183)")
     ap.add_argument("--wikidata-websites",action="store_true",help="Discover website candidates via exact Wikidata P2333 matches, then independently verify each site")
     args=ap.parse_args()
     if args.workers < 1 or args.workers > 16:
@@ -1035,7 +1195,7 @@ def main() -> int:
             agent.finish(result, time.monotonic() - prior_runtime / 1000)
     nav_report = {"status": "disabled", "requests": 0, "matched_profiles": 0}
     if args.nav_jobs and results:
-        nav_client = NavJobFeed(timeout=args.timeout)
+        nav_client = NavJobFeed(timeout=args.timeout, max_pages=args.nav_pages, max_details=args.nav_details, lookback_days=args.nav_days)
         nav_report = nav_client.enrich(results)
         # NAV is a batch-level shared source. Attribute its shared request cost
         # once, and count per-ad requests on the matching company profile.

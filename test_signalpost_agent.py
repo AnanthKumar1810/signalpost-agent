@@ -99,6 +99,9 @@ class AgentTests(unittest.TestCase):
         dashboard = sp.make_dashboard(source)
         page = dashboard.read_text(encoding="utf-8")
         self.assertIn("Signalpost company profiles", page)
+        self.assertIn("Compare selected", page)
+        self.assertIn("Filter by result status", page)
+        self.assertIn("max-height", page)
         self.assertIn("Safe summary", page)
         self.assertNotIn("</script><script>bad()", page)
 
@@ -120,6 +123,12 @@ class AgentTests(unittest.TestCase):
         self.assertIn(("revenue_nok", 750000), [(fact["field"], fact["value"]) for fact in financials["facts"]])
         self.assertEqual({c["family"] for c in result["claims"]}, set(sp.FAMILIES))
         self.assertIn("Eksempel AS", result["summary"]["text"])
+        self.assertIn("registered activity as Programming", result["summary"]["text"])
+        self.assertIn("12 registered employees", result["summary"]["text"])
+        self.assertIn("revenue NOK 750,000", result["summary"]["text"])
+        self.assertIn("net result NOK 125,000", result["summary"]["text"])
+        self.assertIn("Daglig leder: Ada Nord", result["summary"]["text"])
+        self.assertTrue(result["summary"]["evidence_ids"])
         people = next(c for c in result["claims"] if c["family"] == "people")
         self.assertEqual(people["facts"][0]["value"]["name"], "Ada Nord")
 
@@ -234,6 +243,9 @@ class AgentTests(unittest.TestCase):
         self.assertFalse(sp.legal_name_matches_page(
             "NORDIC COFFEE ROASTERS AS", "Nordic Coffee Academic Partnership", "Nordic Coffee Academic Partnership",
         ))
+        self.assertTrue(sp.legal_name_matches_page("DIPS AS", "DIPS", "DIPS"))
+        self.assertTrue(sp.legal_name_matches_page("DIPS AS", "About DIPS and how DIPS supports hospitals."))
+        self.assertFalse(sp.legal_name_matches_page("DIPS AS", "We work with DIPS."))
 
     def test_website_collector_accepts_suffix_free_name_in_page_body(self):
         class Headers:

@@ -38,10 +38,11 @@ def _name_key(value: Any) -> str:
 class NavJobFeed:
     """Scan recent NAV feed pages once per batch and verify candidate ad details."""
 
-    def __init__(self, timeout: float = 8, max_pages: int = 3, max_details: int = 100):
+    def __init__(self, timeout: float = 8, max_pages: int = 25, max_details: int = 100, lookback_days: int = 180):
         self.timeout = timeout
-        self.max_pages = max_pages
-        self.max_details = max_details
+        self.max_pages = max(1, min(int(max_pages), 100))
+        self.max_details = max(1, min(int(max_details), 500))
+        self.lookback_days = max(1, min(int(lookback_days), 183))
         self.requests = 0
         self.error: str | None = None
         self.truncated = False
@@ -109,10 +110,11 @@ class NavJobFeed:
             token = token_lines[-1] if token_lines else ""
             if not token or token.count(".") != 2:
                 raise ValueError("NAV did not return a usable public experiment token")
-            # NAV's feed is chronological and may contain years of history.
-            # Keep the first run bounded to recent changes; a scheduled client
-            # with persisted cursors can safely widen coverage incrementally.
-            since = email.utils.format_datetime(dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=7), usegmt=True)
+            # NAV says postings cannot remain active longer than six months.
+            # Cover that entire active lifetime (within a bounded page budget)
+            # so a posting that has not changed this week is not systematically
+            # invisible to the collector.
+            since = email.utils.format_datetime(dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=self.lookback_days), usegmt=True)
             feed_url = BASE + "/api/v1/feed"
             candidates: dict[str, dict[str, Any]] = {}
             for _ in range(self.max_pages):
@@ -214,7 +216,8 @@ class NavJobFeed:
                     else:
                         profile.setdefault("claims", []).append({"family": "jobs", "status": "available", "facts": facts})
             return {"requests": self.requests, "matched_profiles": matched, "status": "complete", "truncated": self.truncated,
-                    "pages_limit": self.max_pages, "detail_limit": self.max_details, "candidate_count": len(candidates)}
+                    "pages_limit": self.max_pages, "detail_limit": self.max_details, "lookback_days": self.lookback_days,
+                    "candidate_count": len(candidates)}
         except Exception as exc:
             self.error = f"{type(exc).__name__}: {exc}"
             return {"requests": self.requests, "matched_profiles": 0, "status": "failed", "error": self.error}
