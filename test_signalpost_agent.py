@@ -52,6 +52,19 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(financial[0][1], "not_available")
         self.assertEqual(financial[0][2], [])
 
+    def test_financial_http_500_remains_failed_without_evidence_of_form_exclusion(self):
+        # The current live failure is a foundation (STI). An HTTP 500 does not
+        # prove that the accounts question is not applicable to this form.
+        exc = urllib.error.HTTPError(f"{sp.ACCOUNTS}/987441623", 500, "Internal Server Error", {}, None)
+        with patch.object(sp, "get_json", side_effect=exc):
+            env = {"identity_anchor": {"organisation_form": "STI"}, "operations": {"requests": 0},
+                   "source_snapshots": [], "evidence": [], "errors": [], "changes": []}
+            claims = []
+            self.agent.financials("987441623", env, lambda *args, **kwargs: claims.append((args, kwargs)))
+        financial = next(item for item in claims if item[0][0] == "financials")
+        self.assertEqual(financial[0][1], "failed")
+        self.assertIn("HTTP 500", financial[1]["reason"])
+
     def test_accounts_lookup_uses_brreg_production_not_preview(self):
         self.assertEqual(sp.ACCOUNTS, "https://data.brreg.no/regnskapsregisteret/regnskap")
         self.assertNotIn(".ppe.", sp.ACCOUNTS)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import email.utils
 import hashlib
 import html
@@ -30,6 +31,8 @@ from urllib.robotparser import RobotFileParser
 from nav_jobs import NavJobFeed
 from public_ats import fetch_linked_jobs
 from wikidata_websites import WikidataWebsiteDiscovery
+from brave_websites import BraveWebsiteDiscovery
+from llm_summary import LLMSummaryAgent
 
 BRREG = "https://data.brreg.no/enhetsregisteret/api"
 # Query BRREG production. The PPE host is pre-production and has no service guarantee.
@@ -1101,11 +1104,20 @@ def main() -> int:
     ap.add_argument("--nav-details",type=int,default=100,help="Maximum NAV job details to fetch per batch (default: 100; hard cap: 500)")
     ap.add_argument("--nav-days",type=int,default=180,help="NAV update lookback in days (default: 180; hard cap: 183)")
     ap.add_argument("--wikidata-websites",action="store_true",help="Discover website candidates via exact Wikidata P2333 matches, then independently verify each site")
+    ap.add_argument("--brave-websites",action="store_true",help="After BRREG and Wikidata find no website, use Brave Search for candidate URLs; requires BRAVE_SEARCH_API_KEY and a Brave plan with storage rights")
+    ap.add_argument("--brave-max-requests",type=int,default=600,help="Maximum Brave requests per batch (default: 600; hard cap: 2000)")
+    ap.add_argument("--llm-summary",action="store_true",help="Opt in to an API-key-gated evidence-grounded summary; invalid output falls back to the deterministic summary")
     args=ap.parse_args()
     if args.workers < 1 or args.workers > 16:
         ap.error("--workers must be between 1 and 16")
     if args.wikidata_websites and args.no_website:
         ap.error("--wikidata-websites requires website fetching; remove --no-website")
+    if args.brave_websites and args.no_website:
+        ap.error("--brave-websites requires website fetching; remove --no-website")
+    if args.brave_websites and not args.wikidata_websites:
+        ap.error("--brave-websites runs only after Wikidata; include --wikidata-websites")
+    if args.brave_websites and not 1 <= args.brave_max_requests <= 2000:
+        ap.error("--brave-max-requests must be between 1 and 2000")
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         ap.error("--timeout must be a positive finite number")
     resolved_paths = {"input": args.input.resolve(), "output": args.output.resolve(), "state": args.state.resolve()}
@@ -1125,6 +1137,20 @@ def main() -> int:
             judge = WebSearchJudge(max_calls=1)
         except Exception as exc:
             ap.error(f"could not enable web-search judge: {exc}")
+    brave = None
+    if args.brave_websites:
+        if os.environ.get("SIGNALPOST_BRAVE_STORAGE_RIGHTS", "").strip().lower() not in {"1", "true", "yes"}:
+            ap.error("Brave Search results may be retained in verified profile URLs; confirm a plan with storage rights by setting SIGNALPOST_BRAVE_STORAGE_RIGHTS=1")
+        try:
+            brave = BraveWebsiteDiscovery(timeout=min(args.timeout, 10), max_requests=args.brave_max_requests)
+        except Exception as exc:
+            ap.error(f"could not enable Brave Search discovery: {exc}")
+    summary_agent = None
+    if args.llm_summary:
+        try:
+            summary_agent = LLMSummaryAgent(timeout=min(args.timeout + 15, 45))
+        except Exception as exc:
+            ap.error(f"could not enable LLM summary: {exc}")
     agent=Agent(args.state,not args.no_website,args.timeout)
     n=0
     started_batch=time.monotonic()
@@ -1193,6 +1219,130 @@ def main() -> int:
             agent.website(org, candidate["site"], (result.get("identity_anchor") or {}).get("legal_name") or "", result, add_site_claim)
             prior_runtime = result.get("operations", {}).get("runtime_ms", 0)
             agent.finish(result, time.monotonic() - prior_runtime / 1000)
+    brave_report = {"status": "disabled", "requests": 0, "target_count": 0,
+                    "candidate_count": 0, "verified_candidate_count": 0,
+                    "estimated_cost_usd": 0.0, "errors": []}
+    if brave and results:
+        failed_wikidata = set(wikidata_report.get("failed_organisations", []))
+        candidate_count = verified_count = 0
+        estimated_cost = 0.0
+        searched = 0
+        for index, original in enumerate(results):
+            org = str(original.get("organisation_number") or "")
+            anchor = original.get("identity_anchor") or {}
+            if anchor.get("status") != "verified" or org in failed_wikidata:
+                continue
+            details = next((item for item in original.get("claims", []) if item.get("family") == "company_details"), {})
+            registered_site = any(fact.get("field") == "website" and fact.get("value")
+                                  for fact in details.get("facts", []))
+            discovery_state = original.get("website_discovery") or {}
+            if registered_site or discovery_state.get("status") != "not_found":
+                continue
+            searched += 1
+            search_result = brave.discover(org, str(anchor.get("legal_name") or ""))
+            attempted_web_requests = 0
+            verified_trial = None
+            ambiguous_candidate = False
+            blocked_candidate = False
+            candidate_count += len(search_result.get("candidate_urls", []))
+            for candidate_url in search_result.get("candidate_urls", []):
+                trial = copy.deepcopy(original)
+                trial["claims"] = [item for item in trial.get("claims", [])
+                                   if item.get("family") not in {"web_presence", "jobs", "public_activity"}]
+                def add_candidate_claim(family: str, status: str, facts: list[dict[str, Any]] | None = None,
+                                        reason: str | None = None, _trial: dict[str, Any] = trial) -> None:
+                    _trial.setdefault("claims", []).append({"family": family, "status": status,
+                        "facts": facts or [], **({"reason": reason} if reason else {})})
+                before_requests = trial.get("operations", {}).get("requests", 0)
+                agent.website(org, candidate_url, str(anchor.get("legal_name") or ""), trial, add_candidate_claim)
+                used_requests = trial.get("operations", {}).get("requests", 0) - before_requests
+                attempted_web_requests += max(0, used_requests)
+                web_claim = next((item for item in trial.get("claims", []) if item.get("family") == "web_presence"), {})
+                if web_claim.get("status") == "available":
+                    verified_trial = trial
+                    break
+                ambiguous_candidate = ambiguous_candidate or web_claim.get("status") == "ambiguous"
+                blocked_candidate = blocked_candidate or web_claim.get("status") == "blocked"
+            target = verified_trial if verified_trial is not None else original
+            target.setdefault("website_discovery", {})
+            target["website_discovery"].update({
+                "brave_status": ("candidate_verified" if verified_trial is not None else
+                                 "candidate_unverified" if search_result.get("candidate_urls") else search_result.get("status")),
+                "brave_method": "brave_org_number_then_legal_name_candidate_search",
+                "brave_requests": search_result.get("requests", 0),
+                "brave_billable_requests": search_result.get("billable_requests", 0),
+                "brave_estimated_cost_usd": search_result.get("estimated_cost_usd", 0.0),
+                "candidate_urls_retained": False,
+            })
+            base_requests = original.get("operations", {}).get("requests", 0)
+            target.setdefault("operations", {})["requests"] = base_requests + search_result.get("requests", 0) + attempted_web_requests
+            target["operations"]["brave_search_estimated_cost_usd"] = search_result.get("estimated_cost_usd", 0.0)
+            prior_estimate = target["operations"].get("third_party_cost_estimate_usd", 0.0) or 0.0
+            target["operations"]["third_party_cost_estimate_usd"] = round(prior_estimate + search_result.get("estimated_cost_usd", 0.0), 6)
+            if search_result.get("requests", 0):
+                target["operations"]["third_party_cost_usd"] = None
+            if verified_trial is not None:
+                verified_count += 1
+                prior_runtime = target.get("operations", {}).get("runtime_ms", 0)
+                agent.finish(target, time.monotonic() - prior_runtime / 1000)
+                results[index] = target
+            elif search_result.get("candidate_urls"):
+                for item in target.get("claims", []):
+                    if item.get("family") == "web_presence":
+                        item["status"] = "ambiguous" if ambiguous_candidate else "blocked" if blocked_candidate else "failed"
+                        item["reason"] = ("Brave returned candidate pages, but none passed exact-company identity verification" if ambiguous_candidate
+                                           else "Candidate pages were blocked by their access policy" if blocked_candidate
+                                           else "Brave candidate pages could not be fetched and verified")
+                    elif item.get("family") in {"jobs", "public_activity"}:
+                        item["status"] = "not_available" if ambiguous_candidate else "blocked" if blocked_candidate else "failed"
+                        item["reason"] = "No verified company website was available for this lookup"
+                if not ambiguous_candidate:
+                    if not blocked_candidate:
+                        target.setdefault("errors", []).append({"type": "brave_candidate_verification_failed", "message": "Candidate pages could not be safely verified; no candidate facts were published"})
+                prior_runtime = target.get("operations", {}).get("runtime_ms", 0)
+                agent.finish(target, time.monotonic() - prior_runtime / 1000)
+            if verified_trial is None:
+                results[index] = target
+            estimated_cost += search_result.get("estimated_cost_usd", 0.0)
+        brave_report = {"status": "complete" if not brave.errors else "partial" if brave.requests else "failed",
+                        "requests": brave.requests, "billable_requests": brave.billable_requests, "target_count": searched,
+                        "candidate_count": candidate_count, "verified_candidate_count": verified_count,
+                        "estimated_cost_usd": round(estimated_cost, 6),
+                        "candidate_urls_retained": False, "errors": brave.errors}
+    llm_summary_report = {"status": "disabled", "calls": 0, "accepted": 0,
+                          "rejected_or_failed": 0, "estimated_cost_usd": 0.0}
+    if summary_agent and results:
+        with ThreadPoolExecutor(max_workers=min(args.workers, 4)) as pool:
+            summaries = list(pool.map(summary_agent.summarize, results))
+        calls = accepted = rejected = 0
+        estimated_cost = 0.0
+        estimate_unknown = False
+        for result, generated in zip(results, summaries):
+            calls += generated.get("calls_made", 0)
+            if generated.get("summary"):
+                previous = result.get("summary") or {}
+                generated["summary"]["unknown_families"] = previous.get("unknown_families", [])
+                result["summary"] = generated["summary"]
+                accepted += 1
+            elif generated.get("calls_made", 0):
+                rejected += 1
+            result["summary_agent"] = {key: generated.get(key) for key in ("status", "model", "usage", "error") if generated.get(key) is not None}
+            result.setdefault("operations", {})["requests"] = result.get("operations", {}).get("requests", 0) + generated.get("calls_made", 0)
+            if generated.get("calls_made", 0):
+                estimate = generated.get("estimated_cost_usd")
+                if isinstance(estimate, (int, float)):
+                    estimated_cost += estimate
+                    prior = result["operations"].get("third_party_cost_estimate_usd", 0.0) or 0.0
+                    result["operations"]["third_party_cost_estimate_usd"] = round(prior + estimate, 8)
+                else:
+                    estimate_unknown = True
+                result["operations"]["third_party_cost_usd"] = None
+        llm_summary_report = {"status": "complete" if not rejected else "partial",
+                              "calls": calls, "accepted": accepted,
+                              "rejected_or_failed": rejected,
+                              "estimated_cost_usd": None if estimate_unknown else round(estimated_cost, 8),
+                              "model": summary_agent.model,
+                              "cost_note": "Estimate uses the published GPT-6 Luna input/output rates; refresh model pricing before an official run."}
     nav_report = {"status": "disabled", "requests": 0, "matched_profiles": 0}
     if args.nav_jobs and results:
         nav_client = NavJobFeed(timeout=args.timeout, max_pages=args.nav_pages, max_details=args.nav_details, lookback_days=args.nav_days)
@@ -1246,7 +1396,8 @@ def main() -> int:
         for c in row.get("claims",[]):
             bucket=families.setdefault(c.get("family","unknown"),{})
             status=c.get("status","unknown"); bucket[status]=bucket.get(status,0)+1
-    report={"input_count":len(orgs),"output_count":n,"unique_input_count":len(set(orgs)),"all_inputs_have_terminal_result":n==len(orgs),"identity_status_counts":states,"family_status_counts":families,"requests":requests,"nav_job_feed":nav_report,"wikidata_website_discovery":wikidata_report,"runtime_ms_sum":runtime,"wall_runtime_ms":int((time.monotonic()-started_batch)*1000),"workers":1 if judge else args.workers,"errors":errors,"third_party_cost_usd":round(costs,6) if cost_known else None,"third_party_cost_status":"measured" if cost_known else "unknown; check provider billing","cost_basis":"no paid provider calls in default mode; opt-in provider billing is not available to this process","output":str(args.output),"dashboard":str(dashboard)}
+    estimate_total = sum((row.get("operations") or {}).get("third_party_cost_estimate_usd", 0.0) or 0.0 for row in read_jsonl_records(args.output))
+    report={"input_count":len(orgs),"output_count":n,"unique_input_count":len(set(orgs)),"all_inputs_have_terminal_result":n==len(orgs),"identity_status_counts":states,"family_status_counts":families,"requests":requests,"nav_job_feed":nav_report,"wikidata_website_discovery":wikidata_report,"brave_website_discovery":brave_report,"llm_summary":llm_summary_report,"runtime_ms_sum":runtime,"wall_runtime_ms":int((time.monotonic()-started_batch)*1000),"workers":1 if judge else args.workers,"errors":errors,"third_party_cost_usd":round(costs,6) if cost_known else None,"third_party_cost_estimate_usd":round(estimate_total,8),"third_party_cost_status":"measured" if cost_known else "provider charge unavailable; see estimate and usage records","cost_basis":"default run makes no paid calls; optional Brave/OpenAI costs are estimates from published rates and response usage, not billing records","output":str(args.output),"dashboard":str(dashboard)}
     args.output.with_suffix(args.output.suffix+".report.json").write_text(json.dumps(report,indent=2,ensure_ascii=False)+"\n",encoding="utf-8")
     print(json.dumps(report,ensure_ascii=False))
     return 0
