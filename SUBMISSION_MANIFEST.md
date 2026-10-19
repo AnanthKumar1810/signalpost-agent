@@ -3,7 +3,7 @@
 Prepared: 19 October 2026 (updated optional feature package; see commit recorded below)
 
 - Repository: https://github.com/AnanthKumar1810/signalpost-agent
-- Tested code revision: update to the commit recorded in the repository after this package is pushed. The original baseline and 19 October live measurements are identified separately in the judge report; never attribute old measurements to a newer revision.
+- Feature implementation commit: `d1916cae807f272d6bb2e266287373dfe85bf095` (the subsequent manifest-only commit records this tested revision). The original baseline and 19 October live measurements are identified separately in the judge report; never attribute old measurements to a newer revision.
 - One-command run from a clean checkout (Python 3.10+; standard library only):
   `python signalpost_agent.py --input smoke_100.json --output outputs/profiles.jsonl --state outputs/state.sqlite3 --timeout 12 --workers 4 --nav-jobs --wikidata-websites`
 - Reproduce the recorded final combined 100-company smoke run:
@@ -15,6 +15,7 @@ Prepared: 19 October 2026 (updated optional feature package; see commit recorded
 - Optional LLM summaries: enable `--llm-summary` with `OPENAI_API_KEY`. The system prompt follows the participant's exact plain-text-only rules and receives the identity anchor, claims (`family`, `status`, `facts`, `reason`) and changes; it does not receive raw page content or search results. Output failing local format, missing-category and numeric checks is rejected and the deterministic summary remains. The default run performs no LLM call. Fixture tests passed; no live model call was run because no key was configured, and format checks cannot prove all semantic claims.
 - Optional paid API usage and total costs are not live-tested or billing-verified. Recheck provider terms, storage rights, model availability and published rates before an official run.
 - A GitHub Pages workflow and a frozen mobile-responsive sample dashboard are included; the dashboard is practice data from 19 October, not a live feed or official Builderr score. Hosting availability depends on the repository's Pages settings and successful Actions deployment.
+- Clean-room check: extracted the committed source archive into a fresh directory, created an empty Python 3.13 virtual environment, ran the declared `pip install -r requirements.txt`, and passed all 94 tests. The noninteractive 100-input CLI completed and emitted one result per input, but all 100 identities failed because this environment could not resolve BRREG's host; this run verifies packaging and terminal-result behavior only, not profile quality or live coverage. A direct `git clone` was blocked by the sandbox's Windows Git subprocess restriction, so the committed source archive was used for an exact clean-source test instead.
 - Contact: Sirela Ananth Kumar, `sananthkumar3@gmail.com` (from the participant details provided for this project).
 - Test inputs and outputs: `smoke_100.json`, `smoke_100_sample.json`, and `outputs/live-100-combined-final.jsonl` with its JSON report and HTML profile browser.
 - Source and reuse: BRREG open data is published under NLOD 2.0. The accounts service is described as a preview and may be incomplete or unavailable. Third-party websites remain subject to their access rules and robots policies. Restricted social platforms are not scraped.
