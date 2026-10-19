@@ -42,7 +42,7 @@ Each published fact points to a content-hashed source snapshot and includes a re
 
 ```powershell
 python -m unittest discover -s . -p 'test_*.py' -v
-python -m py_compile signalpost_agent.py nav_jobs.py wikidata_websites.py claim_judge.py test_signalpost_agent.py test_input_stages.py test_claim_judge.py test_qa_regressions.py test_wikidata_websites.py
+python -m py_compile signalpost_agent.py nav_jobs.py public_ats.py wikidata_websites.py claim_judge.py test_signalpost_agent.py test_input_stages.py test_claim_judge.py test_qa_regressions.py test_wikidata_websites.py test_public_ats.py
 ```
 
 The current local suite passes 83 tests, including RSS/Atom evidence, NAV entity checks, conservative full-page company-name matching, exact-ID Wikidata discovery fixtures, and linked public ATS-board evidence. A fresh combined live 100-company run returned 100 complete profiles and verified identities in 177.3 seconds with 348 requests; 99 finance lookups returned data and one returned HTTP 500. It found 1 website, 1 jobs result, and 1 public-activity result. NAV found two candidates and matched zero; Wikidata checked 92 companies without a registered website and returned no candidates. These source changes did not increase coverage in this sample. The historical 108.7-second run is a separate baseline. See [the judge report](SIGNALPOST_JUDGE_REPORT.md), [the coverage-improvement report](COVERAGE_IMPROVEMENTS.md), and [the independent QA report](QA_TEST_REPORT.md) for exact results and limitations.

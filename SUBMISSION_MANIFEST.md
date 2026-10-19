@@ -3,7 +3,7 @@
 Prepared: 19 October 2026
 
 - Repository: https://github.com/AnanthKumar1810/signalpost-agent
-- Submission source revision: to be filled with the pushed commit hash after final verification. The original baseline and the 19 October live measurements are identified separately in the judge report; never attribute old measurements to a newer revision.
+- Tested code revision (pushed to `main`): `c20e346b5a2b0a258a150a0cb02f88421cb1cfcb`. The original baseline and 19 October live measurements are identified separately in the judge report; never attribute old measurements to a newer revision.
 - One-command run from a clean checkout (Python 3.10+; standard library only):
   `python signalpost_agent.py --input smoke_100.json --output outputs/profiles.jsonl --state outputs/state.sqlite3 --timeout 12 --workers 4 --nav-jobs --wikidata-websites`
 - Reproduce the recorded final combined 100-company smoke run:
