@@ -1,0 +1,82 @@
+{
+  "input_count": 100,
+  "output_count": 100,
+  "unique_input_count": 100,
+  "all_inputs_have_terminal_result": true,
+  "identity_status_counts": {
+    "verified": 100
+  },
+  "family_status_counts": {
+    "company_details": {
+      "available": 100
+    },
+    "locations": {
+      "available": 99,
+      "not_available": 1
+    },
+    "people": {
+      "available": 100
+    },
+    "financials": {
+      "available": 99,
+      "failed": 1
+    },
+    "web_presence": {
+      "not_available": 100
+    },
+    "jobs": {
+      "not_available": 100
+    },
+    "public_activity": {
+      "not_available": 100
+    }
+  },
+  "requests": 301,
+  "nav_job_feed": {
+    "status": "disabled",
+    "requests": 0,
+    "matched_profiles": 0
+  },
+  "wikidata_website_discovery": {
+    "status": "disabled",
+    "requests": 0,
+    "target_count": 0,
+    "candidate_count": 0,
+    "errors": []
+  },
+  "tinyfish_website_discovery": {
+    "status": "disabled",
+    "requests": 0,
+    "target_count": 0,
+    "candidate_count": 0,
+    "verified_candidate_count": 0,
+    "estimated_cost_usd": 0.0,
+    "errors": []
+  },
+  "brave_website_discovery": {
+    "status": "disabled",
+    "requests": 0,
+    "target_count": 0,
+    "candidate_count": 0,
+    "verified_candidate_count": 0,
+    "estimated_cost_usd": 0.0,
+    "errors": []
+  },
+  "llm_summary": {
+    "status": "disabled",
+    "calls": 0,
+    "accepted": 0,
+    "rejected_or_failed": 0,
+    "estimated_cost_usd": 0.0
+  },
+  "runtime_ms_sum": 374481,
+  "wall_runtime_ms": 48156,
+  "workers": 8,
+  "errors": 1,
+  "third_party_cost_usd": 0.0,
+  "third_party_cost_estimate_usd": 0.0,
+  "third_party_cost_status": "measured",
+  "cost_basis": "default run makes no paid calls; TinyFish Search was documented as free when integrated; optional Brave/OpenAI costs are estimates from published rates and response usage, not billing records",
+  "output": "outputs\\benchmark-100-a-official.jsonl",
+  "dashboard": "outputs\\benchmark-100-a-official.jsonl.html"
+}

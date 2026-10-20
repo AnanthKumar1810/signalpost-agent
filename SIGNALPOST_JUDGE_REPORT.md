@@ -1,67 +1,13 @@
-# Signalpost judge report
+# Independent qualification-readiness review — 20 October 2026
 
-**Prepared:** 19 October 2026
-**Purpose:** independent local assessment of the prepared build; this is not Builderr's official score.
+**Official Builderr score: unknown. Qualification is not demonstrated.** The current [Builderr Signalpost challenge](https://builderr.ai/challenges/signalpost) requires 65/100 on its own evaluation, with 50 points for recall, 30 for precision/evidence, 12 for synthesis, and 8 for UX. The evaluator's checked collection and hidden sample are unavailable here. A local score, including any earlier 44/100 or similar estimate, would be speculation.
 
-## Finding
+The implementation is operational: a fresh one-command run returned 1,000/1,000 profiles and verified identities in 662.498 seconds with 3,313 outbound requests and no paid provider calls. The independent audit counted 29,719 facts and zero structural lineage violations. This establishes output completeness and evidence structure, not factual recall against the checked collection. Annual accounts were available for 993 companies, while 38 had a verified website, six had some jobs-family information in the pre-fix run, and twelve had dated public activity. Those low external-source counts make recall the principal risk to qualification.
 
-The project is runnable and its 100-company smoke-test artifact is complete. A truthful Builderr score out of 100 cannot be calculated locally: Builderr compares against its checked findings, which are unavailable, and says the local smoke test is not the competition score. The older 44/100 estimate in an earlier draft was not measured against Builderr's rubric and is withdrawn. No numeric official or predicted score is claimed here.
+On the controlled 100-company sample, the official-only run took 48.156 seconds, used 301 requests, and published 2,907 facts. Adding deterministic website, NAV, and Wikidata collection took 143.560 seconds, used 350 requests, and published 2,928 facts. It found two verified websites, two generic careers pages (their presence does **not** prove current openings), and one dated activity feed. One accounts lookup returned BRREG HTTP 500; the financial family remained failed. Both variants returned 100 verified identities. This comparison demonstrates only a small measured recall lift for those sources on that sample.
 
-The current official rubric is 50 recall, 30 precision/evidence, 12 synthesis, and 8 UX, with qualification at 65/100 on an official run. Builderr's current instructions require the reusable agent and a 100-company smoke report; the 1,000+ profiles banner refers to testing at scale, while the detailed submission section says precomputed profiles are not needed for ranking. The current page states the evaluated batch is 300 companies and its public table is based on validated evidence from that run. Those public leaderboard values cannot be mapped onto this project's code without running Builderr's harness.
+The separate 100-company TinyFish run verified no additional sites, incurred 484 requests and took 505.640 seconds, while concurrent network load caused DNS failures. It is not a fair estimate of provider effectiveness. Ten direct TinyFish searches predominantly returned directories and registries; those were rejected as official websites. TinyFish is optional and not in the evaluator command because the evaluator cannot rely on this participant's private key. Brave and the optional LLM summary were not live-tested without credentials; no paid-model claims are included in the score assessment.
 
-## Measured smoke run
+Precision controls include an exact BRREG organisation-number anchor, page-level company identity verification, public-address/HTTPS/robots checks, cross-company evidence rejection, recorded retrieval dates, and honest unknown/failed states. They are strong local safeguards but do not establish a 30/30 hidden precision score. Synthesis is deterministic by default and explicitly names unknown categories. The HTML dashboard is responsive and reviewable locally; GitHub Pages hosting has not been confirmed enabled. Neither area has an independently measured Builderr score.
 
-The original baseline run used the fixed 100-company sample selected from 411,160 public-universe rows (seed 20261017). It produced 100 result envelopes for 100 distinct inputs and verified all 100 legal identities. Runtime was 108,675 ms wall time with four workers and 322 outbound requests. It recorded four source errors. Paid API cost was USD 0.00 because the default path uses no paid provider. The most recent run with NAV, Wikidata discovery, public ATS adapters and current profile code is recorded separately below; it must not be confused with this baseline.
-
-| Data family | Available | Not available | Ambiguous | Failed |
-|---|---:|---:|---:|---:|
-| Company details | 100 | 0 | 0 | 0 |
-| Registered location | 99 | 1 | 0 | 0 |
-| People / registered roles | 100 | 0 | 0 | 0 |
-| Financials | 99 | 0 | 0 | 1 |
-| Website presence | 1 | 92 | 4 | 3 |
-| Jobs | 1 | 96 | 0 | 3 |
-| Public activity | 1 | 96 | 0 | 3 |
-
-The single financial failure was a BRREG HTTP 500 response after a transient retry; no financial value was invented. Website, jobs, and activity failures reflect unavailable or blocked site retrievals. “Not available” means the configured permitted sources returned no usable fact; it does not prove the fact does not exist elsewhere. One activity profile included ten dated items from the company's registered website feed and passed the evidence-integrity checks. The historical NAV scan used four requests, was capped at three pages, found zero matching profiles, and reported truncation.
-
-Machine-readable baseline details: `outputs/live-100-coverage-final.jsonl.report.json`. The profile JSONL contains one envelope per input. The HTML file is a convenience viewer, not the source of truth.
-
-### Fresh combined benchmark (19 October)
-
-The current code was run with `--nav-jobs --wikidata-websites` on the same 100-company input. It returned 100/100 complete envelopes and verified all 100 identities in 177,328 ms using four workers. The run report counted 348 outbound requests, including 28 NAV requests and 2 Wikidata queries, and four source errors. Measured third-party paid API cost was USD 0.00. One finance lookup still returned HTTP 500. Website presence remained 1 available, 92 not available, 4 ambiguous and 3 failed; jobs and public activity each remained 1 available, 96 not available and 3 failed. NAV saw two employer candidates, matched zero companies and reported truncation at 25 pages. Wikidata queried 92 profiles without a BRREG website and returned zero exact-ID candidates. The ATS adapters were exercised by fixtures but found no new live board-linked job in this batch. Compared with baseline, the new sources caused **no measured external-coverage increase**.
-
-The combined profile file has 2,923 facts. A local structural check found zero facts without evidence IDs, zero IDs without a matching source snapshot, zero source snapshots belonging to a different company, and zero `evidence_integrity` errors. This checks lineage structure, not the truth or completeness of each fact. Only 1 of 100 profiles had information in all five grouped information areas. Reproduction: `python signalpost_agent.py --input smoke_100.json --output outputs/live-100-combined-final.jsonl --state outputs/live-100-combined-final.sqlite3 --timeout 8 --workers 4 --nav-jobs --wikidata-websites`.
-
-## Reliability and evidence controls
-
-The agent matches on Norwegian organisation number using BRREG as the identity anchor. Published facts retain source URL, retrieval time, excerpts and a content-hashed source snapshot. A final gate checks that claim, evidence and snapshot agree on company number, source family and field; financial claims also have the requested entity checked. A fact that fails these checks is dropped. A missing, blocked or failed source remains explicitly unavailable, ambiguous, or failed instead of becoming a guessed value. Retries are bounded and counted.
-
-The historical live-run revision passed 71 local tests. The current source tree passes 83 local tests after adding conservative website matching, optional Wikidata exact-ID discovery, linked public job-board support, and expanded profile-browser behavior. These tests establish behavior on controlled cases; the three live comparisons above show no recall lift in this sample.
-
-## Competition readiness and limits
-
-The current official detailed instructions ask for a 100-company smoke-test result and reproducibility metadata in the manifest. Builderr supplies companies for official runs and precomputed profiles are not used in ranking. The public page also advertises a 1,000+ profile scale option; that is a local testing scale, not a static dataset submission requirement.
-
-The main measured weakness is coverage outside BRREG. Only one website was usable and only one jobs profile was found in this sample. The current code expands NAV to a bounded 180-day active-posting window and supports public Greenhouse, Lever, and Ashby boards only when a verified company website links to them; a fresh 100-company run did not improve coverage. Activity collection still depends on dated pages or feeds from a verified company site. Restricted LinkedIn/Internshala scraping is intentionally not used. The live run demonstrates that an upstream API can fail for a specific company while the agent preserves a complete, honest profile.
-
-The code is prepared but has not been sent to Builderr. Any score, qualification decision, and leaderboard position remain pending official evaluation.
-
-Official challenge details: [Builderr Signalpost](https://builderr.ai/challenges/signalpost).
-
-## Coverage diagnosis and current changes
-
-The supplied 2025 universe contains 411,160 rows; 44,855 (10.91%) list a BRREG website. Among AS entities, the rate is 8.8%, and among industry-code-68 entities it is 4.9%. In the saved 100-company run, 92 profiles had no registered website, four were ambiguous, and three failed retrieval. The three fetched ambiguous pages did not contain the exact organisation number or distinctive legal name in their saved text. Therefore widening legal-name matching alone would have rescued none of these cases and cannot fix the dominant no-website gap.
-
-Current code scans full page text for a distinctive normalized legal name (including a suffix-free variant) while preserving exact organisation-number matching and rejecting weak short-name mentions. In the saved sample, the four ambiguous sites did not contain the exact organisation number or distinctive legal name, so widening the check alone did not address that measured gap. The `--wikidata-websites` option discovers website candidates from exact Norwegian organisation-number matches; each candidate remains untrusted until safe-fetch, access-policy and page-identity checks pass. Wikidata is now live-verified on the 100-company sample and returned no candidates. Supported ATS boards explicitly linked from verified company pages and the wider bounded NAV window also returned no additional jobs in this batch. Current coverage figures therefore remain unchanged. The full current local suite passes 83 tests.
-
-## Current score status
-
-| Builderr category | What this project can demonstrate locally | Why the score is unavailable |
-|---|---|---|
-| Recall and coverage (50) | Historical 100-company family counts are recorded; new ATS/NAV logic has adversarial unit coverage. | The evaluator's checked facts and unseen 300-company test batch are not available; the fresh source changes have not been live-benchmarked. |
-| Precision and evidence (30) | 2,909 historical facts passed the structural evidence-link audit; cross-company/source/field mismatch tests fail closed. | Structural linkage is not a labeled truth/precision audit of each claim against Builderr's judged facts. |
-| Synthesis (12) | Current deterministic summary includes sourced identity/activity/finance/leadership when present and identifies unknown families. | No Builderr synthesis grader or calibrated human-scoring run has been applied. |
-| UX (8) | Generated HTML includes search, category-gap/error filters, coverage sorting, compare up to three companies, facts, evidence links and retrieval dates; responsive layout is implemented. | No hosted product or recorded desktop/mobile usability evaluation has been run. |
-
-Thus the correct score today is **not measured**, not zero and not an estimated number. The historical sample is a functional smoke test. A local claim that it “scores 20/50 recall” or “qualifies” would be unsupported.
+The repo includes a 100-company smoke output, the 1,000-company practice output, exact commands, API/cost descriptions, source-policy notes, and a detailed implementation report in `FINAL_TECHNICAL_REPORT.md`. No competition submission was sent. The candid verdict is **working and submission-reviewable, with substantial risk of missing the recall threshold**. A qualification claim would require Builderr's actual evaluation or a representative checked truth set.

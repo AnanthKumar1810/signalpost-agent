@@ -1,0 +1,9 @@
+{
+  "selection": "reservoir sample across valid organisation-number rows",
+  "seed": 20261019,
+  "eligible_rows_scanned": 411160,
+  "sample_size": 1000,
+  "unique_sample_size": 1000,
+  "source_archive_sha256": "1c89710e5b01f8617e86d09fbdff4a52f2f8dbbba297e74f7164b5984f5a0384",
+  "source_file": "signalpost-universe-2025-redownload.jsonl.gz"
+}

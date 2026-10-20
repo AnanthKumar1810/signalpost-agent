@@ -154,6 +154,68 @@ class QARegressionTests(unittest.TestCase):
             with self.subTest(target=target), self.assertRaises(ValueError), patch.object(sp, "public_host", return_value=True):
                 handler.redirect_request(request, None, 302, "Found", {}, target)
 
+    def test_registered_redirect_upgrades_to_https_and_rechecks_identity(self):
+        class Response(_Response):
+            def __init__(self, body, url, kind="html"):
+                super().__init__(body, kind)
+                self.url = url
+
+            def geturl(self):
+                return self.url
+
+        handler = sp.SameHostRedirect("legacy.example", allow_cross_host=True)
+        request = __import__("urllib.request").request.Request("https://legacy.example/robots.txt")
+        with patch.object(sp, "public_host", return_value=True):
+            redirected = handler.redirect_request(
+                request, None, 301, "Moved", {}, "http://replacement.example/robots.txt"
+            )
+        self.assertEqual(redirected.full_url, "https://replacement.example/robots.txt")
+
+        robots = Response(b"User-agent: *\nAllow: /\n", "https://replacement.example/robots.txt", "robots")
+        homepage = Response(
+            b"<html><title>Example Company</title><h1>Example Company</h1></html>",
+            "https://replacement.example/",
+        )
+        env = {"operations": {"requests": 0}, "errors": [], "source_snapshots": [], "evidence": [], "changes": []}
+        claims = []
+        with patch.object(sp, "public_host", return_value=True), patch.object(sp, "open_safe", side_effect=[robots, homepage]) as opener:
+            self.agent.website(
+                "923609016", "https://legacy.example", "Example Company AS", env,
+                lambda *a, **k: claims.append(a), allow_registered_redirect=True,
+            )
+        web = next(item for item in claims if item[0] == "web_presence")
+        self.assertEqual(web[1], "available")
+        self.assertEqual(web[2][0]["value"], "https://replacement.example/")
+        self.assertEqual(opener.call_args_list[1].args[1], "replacement.example")
+
+    def test_registered_redirect_wrong_company_is_not_published(self):
+        class Response(_Response):
+            def __init__(self, body, url, kind="html"):
+                super().__init__(body, kind)
+                self.url = url
+            def geturl(self): return self.url
+        robots = Response(b"User-agent: *\nAllow: /\n", "https://replacement.example/robots.txt", "robots")
+        wrong = Response(b"<title>Different Holdings AS</title><h1>Different Holdings AS</h1>",
+                         "https://replacement.example/")
+        env = {"operations": {"requests": 0}, "errors": [], "source_snapshots": [], "evidence": [], "changes": []}
+        claims = []
+        with patch.object(sp, "public_host", return_value=True), patch.object(sp, "open_safe", side_effect=[robots, wrong]):
+            self.agent.website("923609016", "https://legacy.example", "Example Company AS", env,
+                               lambda *a, **k: claims.append(a), allow_registered_redirect=True)
+        web = next(item for item in claims if item[0] == "web_presence")
+        self.assertEqual(web[1], "ambiguous")
+        self.assertEqual(len(web), 2)
+
+    def test_registered_redirect_privilege_still_rejects_unsafe_targets(self):
+        handler = sp.SameHostRedirect("legacy.example", allow_cross_host=True)
+        request = __import__("urllib.request").request.Request("https://legacy.example/robots.txt")
+        targets = ("https://user:pass@replacement.example/", "https://replacement.example:444/",
+                   "https://127.0.0.1/", "ftp://replacement.example/")
+        for target in targets:
+            with self.subTest(target=target), self.assertRaises(ValueError), patch.object(
+                    sp, "public_host", side_effect=lambda host: host != "127.0.0.1"):
+                handler.redirect_request(request, None, 302, "Found", {}, target)
+
     def test_pinned_https_connection_rejects_private_dns_answer_before_connect(self):
         private_answer = [(2, 1, 6, "", ("127.0.0.1", 443))]
         conn = sp.PinnedHTTPSConnection("company.example", timeout=1)
@@ -161,6 +223,19 @@ class QARegressionTests(unittest.TestCase):
             with self.assertRaisesRegex(OSError, "non-public address"):
                 conn.connect()
         create_socket.assert_not_called()
+
+    def test_fixed_provider_dns_cache_reuses_only_public_checked_answers(self):
+        public_answer = [(2, 1, 6, "", ("192.0.2.10", 443))]
+        # TEST-NET is not globally routable according to ipaddress, so use a
+        # known public resolver address without opening a socket.
+        public_answer[0] = (2, 1, 6, "", ("1.1.1.1", 443))
+        sp._DNS_CACHE.clear()
+        with patch.object(sp.socket, "getaddrinfo", return_value=public_answer) as lookup:
+            one = sp.resolve_connection_addresses("data.brreg.no", 443)
+            two = sp.resolve_connection_addresses("data.brreg.no", 443)
+        self.assertEqual(one, two)
+        lookup.assert_called_once()
+        sp._DNS_CACHE.clear()
 
     def test_cli_preserves_one_terminal_profile_per_invalid_input(self):
         source = self.write("invalid-batch.txt", "123\n923609017\n")

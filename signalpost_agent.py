@@ -15,6 +15,7 @@ import re
 import sqlite3
 import socket
 import sys
+import threading
 import time
 import unicodedata
 import uuid
@@ -23,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,7 @@ from nav_jobs import NavJobFeed
 from public_ats import fetch_linked_jobs
 from wikidata_websites import WikidataWebsiteDiscovery
 from brave_websites import BraveWebsiteDiscovery
+from tinyfish_websites import TinyFishWebsiteDiscovery
 from llm_summary import LLMSummaryAgent
 
 BRREG = "https://data.brreg.no/enhetsregisteret/api"
@@ -41,6 +43,13 @@ CONTACT = re.sub(r"[^A-Za-z0-9@.+_-]", "", os.environ.get("SIGNALPOST_CONTACT", 
 UA = f"SignalpostResearchAgent/0.2 (contact: {CONTACT})"
 STATES = {"available", "not_available", "blocked", "not_applicable", "ambiguous", "failed"}
 FAMILIES = ("company_details", "people", "locations", "financials", "jobs", "public_activity", "web_presence")
+_FIXED_PROVIDER_HOSTS = {
+    "data.brreg.no", "query.wikidata.org", "arbeidsplassen.nav.no",
+    "api.search.brave.com", "api.search.tinyfish.ai", "api.openai.com",
+}
+_DNS_CACHE: dict[tuple[str, int], tuple[float, list[tuple[Any, ...]]]] = {}
+_DNS_CACHE_LOCK = threading.Lock()
+_DNS_CACHE_TTL_SECONDS = 300
 
 
 def now() -> str:
@@ -130,6 +139,19 @@ def page_has_organisation_number(page_text: str, organisation_number: str) -> bo
     return False
 
 
+def domain_matches_legal_name(host: str, legal_name: str) -> bool:
+    """Require open-web candidates to resemble a distinctive legal-name token."""
+    labels = host.lower().rstrip(".").split(".")
+    host_key = "".join(_normalized_name_tokens(" ".join(
+        label for label in labels[:-1] if label not in {"www", "m", "no", "com", "co"}
+    )))
+    tokens = [token for token in _normalized_name_tokens(legal_name)
+              if token not in _LEGAL_FORM_SUFFIXES and len(token) >= 4]
+    if not host_key or not tokens:
+        return False
+    return any(token in host_key for token in tokens) or "".join(tokens) in host_key
+
+
 def official_profile_links(links: list[tuple[str, str]]) -> list[dict[str, str]]:
     """Expose social/profile URLs only when linked by the verified company site; never crawl them."""
     platforms = {
@@ -163,6 +185,61 @@ def _iso_date(value: Any) -> str | None:
         return datetime.strptime(value, "%Y-%m-%d").date().isoformat()
     except ValueError:
         return None
+
+
+def classify_job_page(page_text: str, published_dates: list[str], reference_date: date | None = None) -> dict[str, Any] | None:
+    """Classify a first-party vacancy without claiming freshness we cannot prove."""
+    reference_date = reference_date or datetime.now(timezone.utc).date()
+    closed = bool(re.search(
+        r"position (?:is )?closed|applications? (?:are )?closed|no longer accepting|"
+        r"stillingen er besatt|s(?:ø|o)knadsfristen er utl(?:ø|o)pt|utl(?:ø|o)pt frist",
+        page_text, re.I,
+    ))
+    accepting = bool(re.search(
+        r"\bapply(?:\s+now)?\b|\bsubmit\s+(?:your\s+)?application\b|"
+        r"\bs(?:ø|o)k(?:\s+n(?:å|a)|\s+p(?:å|a)\s+stillingen)?\b|"
+        r"\bsend\b.{0,80}\b(?:s(?:ø|o)knad|application)\b",
+        page_text, re.I,
+    ))
+    if closed or not accepting:
+        return None
+
+    published: list[date] = []
+    deadlines: list[date] = []
+    for raw in published_dates:
+        parsed = _iso_date(str(raw)[:10])
+        if parsed:
+            published.append(date.fromisoformat(parsed))
+    date_pattern = r"(20[0-9]{2}-[01][0-9]-[0-3][0-9]|[0-3]?[0-9][./][01]?[0-9][./]20[0-9]{2})"
+    for match in re.finditer(
+        rf"(published|posted|publisert|publiseringsdato|application deadline|deadline|s(?:ø|o)knadsfrist|frist)"
+        rf"[^0-9]{{0,30}}{date_pattern}", page_text, re.I,
+    ):
+        raw = match.group(2)
+        try:
+            parsed_date = (date.fromisoformat(raw) if "-" in raw else
+                           datetime.strptime(raw.replace("/", "."), "%d.%m.%Y").date())
+            (deadlines if re.search(r"deadline|frist", match.group(1), re.I) else published).append(parsed_date)
+        except ValueError:
+            continue
+    if deadlines and max(deadlines) < reference_date:
+        return None
+    future = [value for value in deadlines if value >= reference_date]
+    recent = [value for value in published if reference_date - timedelta(days=183) <= value <= reference_date]
+    if future or recent:
+        valid = max(future or recent)
+        return {"field": "active_job_title", "freshness": "confirmed", "valid_at": valid.isoformat()}
+    return {"field": "advertised_job_title", "freshness": "unconfirmed", "valid_at": None}
+
+
+def is_generic_careers_title(title: str) -> bool:
+    """A career landing page is evidence of a careers page, not a vacancy."""
+    normalized = re.sub(r"[^\wæøå]+", " ", title.casefold()).strip()
+    return bool(re.fullmatch(
+        r"(?:ledige stillinger|ledig stilling|jobb(?:er|muligheter)?|karriere|"
+        r"careers?|jobs?|job openings|open positions|vacancies|work with us|"
+        r"arbeid hos oss|join our team)", normalized,
+    ))
 
 
 def _find_statements(value: Any, org: str) -> list[dict[str, Any]]:
@@ -199,6 +276,26 @@ def public_host(host: str) -> bool:
     return bool(addresses) and all(address.is_global for address in addresses)
 
 
+def resolve_connection_addresses(host: str, port: int) -> list[tuple[Any, ...]]:
+    """Cache only fixed provider DNS answers after confirming every IP is public."""
+    normalized = host.lower().rstrip(".")
+    key = (normalized, port)
+    if normalized in _FIXED_PROVIDER_HOSTS:
+        with _DNS_CACHE_LOCK:
+            cached = _DNS_CACHE.get(key)
+            if cached and time.monotonic() - cached[0] < _DNS_CACHE_TTL_SECONDS:
+                return list(cached[1])
+    addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    if not addresses:
+        raise OSError("hostname did not resolve to an address")
+    if any(not ipaddress.ip_address(item[4][0]).is_global for item in addresses):
+        raise OSError("hostname resolved to a non-public address")
+    if normalized in _FIXED_PROVIDER_HOSTS:
+        with _DNS_CACHE_LOCK:
+            _DNS_CACHE[key] = (time.monotonic(), list(addresses))
+    return addresses
+
+
 def get_json(url: str, timeout: float = 12, on_retry: Any = None) -> tuple[Any, bytes, int]:
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
     host=urllib.parse.urlparse(url).hostname or ""
@@ -210,10 +307,25 @@ def get_json(url: str, timeout: float = 12, on_retry: Any = None) -> tuple[Any, 
 
 
 class SameHostRedirect(urllib.request.HTTPRedirectHandler):
-    def __init__(self, host: str): self.host = host
+    def __init__(self, host: str, allow_cross_host: bool = False):
+        self.host = host.lower().rstrip(".")
+        self.allow_cross_host = allow_cross_host
+
     def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
-        parsed=urllib.parse.urlparse(newurl)
-        if parsed.scheme != "https" or parsed.hostname != self.host or parsed.port not in (None,443) or parsed.username or parsed.password or not public_host(parsed.hostname or ""):
+        parsed = urllib.parse.urlparse(newurl)
+        target_host = (parsed.hostname or "").lower().rstrip(".")
+        # A BRREG-listed legacy domain may redirect to a replacement company
+        # domain. Follow that redirect only in the explicit registry path, keep
+        # every request encrypted, and retain the public-address pinning check.
+        # Some legacy hosts emit an HTTP redirect even though the replacement
+        # host supports HTTPS; upgrade it before making the request rather than
+        # sending any plaintext request.
+        if self.allow_cross_host and parsed.scheme == "http" and parsed.port is None:
+            parsed = parsed._replace(scheme="https")
+            newurl = urllib.parse.urlunparse(parsed)
+        if (parsed.scheme != "https" or not target_host or parsed.port not in (None, 443)
+                or parsed.username or parsed.password or not public_host(target_host)
+                or (target_host != self.host and not self.allow_cross_host)):
             raise ValueError("cross-domain or unsafe redirect rejected")
         return super().redirect_request(req,fp,code,msg,headers,newurl)
 
@@ -224,11 +336,7 @@ class PinnedHTTPSConnection(http.client.HTTPSConnection):
         if self._tunnel_host:
             raise OSError("HTTPS proxy tunnels are disabled for safe company-site requests")
         port = self.port or 443
-        addresses = socket.getaddrinfo(self.host, port, type=socket.SOCK_STREAM)
-        if not addresses:
-            raise OSError("hostname did not resolve to an address")
-        if any(not ipaddress.ip_address(item[4][0]).is_global for item in addresses):
-            raise OSError("hostname resolved to a non-public address")
+        addresses = resolve_connection_addresses(self.host, port)
         last_error: OSError | None = None
         for family, socktype, proto, _canonname, sockaddr in addresses:
             raw_socket = socket.socket(family, socktype, proto)
@@ -248,11 +356,16 @@ class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
         return self.do_open(PinnedHTTPSConnection, req, context=self._context)
 
 
-def open_safe(req: urllib.request.Request, host: str, timeout: float, on_retry: Any = None) -> Any:
+def open_safe(req: urllib.request.Request, host: str, timeout: float, on_retry: Any = None,
+              allow_cross_host_redirect: bool = False) -> Any:
     # Disable ambient HTTP(S)_PROXY settings so the checked address is the peer
     # that receives the connection; the custom HTTPS connection pins that peer.
     # These are idempotent GETs, so make one bounded retry for transient failures.
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), SameHostRedirect(host), PinnedHTTPSHandler())
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        SameHostRedirect(host, allow_cross_host=allow_cross_host_redirect),
+        PinnedHTTPSHandler(),
+    )
     for attempt in range(2):
         try:
             return opener.open(req, timeout=timeout)
@@ -453,7 +566,7 @@ class Agent:
         self.financials(org, env, claim)
         site = registry_fields["website"]
         if self.website_enabled and site:
-            self.website(org, site, name or "", env, claim)
+            self.website(org, site, name or "", env, claim, allow_registered_redirect=True)
         else:
             claim("web_presence", "not_available", reason="No registry-listed website" if not site else "Website crawling disabled")
             claim("jobs", "not_available", reason="No permitted company-owned careers page checked")
@@ -556,7 +669,8 @@ class Agent:
             env["errors"].append({"source":url,"type":"fetch_error","message":str(exc)})
             claim("people", "failed", reason="Roles endpoint failed")
 
-    def website(self, org: str, site: str, legal_name: str, env: dict[str, Any], claim: Any) -> None:
+    def website(self, org: str, site: str, legal_name: str, env: dict[str, Any], claim: Any,
+                allow_registered_redirect: bool = False, require_domain_name_match: bool = False) -> None:
         count_retry = lambda: env["operations"].__setitem__("requests", env["operations"]["requests"] + 1)
         try:
             raw_site = site if site.startswith(("https://", "http://")) else "https://" + site
@@ -579,9 +693,17 @@ class Agent:
         try:
             robots_req = urllib.request.Request(robots_url, headers={"User-Agent":UA,"Accept":"text/plain"})
             try:
-                with open_safe(robots_req, parsed.hostname, self.timeout, on_retry=count_retry) as robots_response:
-                    if urllib.parse.urlparse(robots_response.geturl()).hostname != parsed.hostname:
+                with open_safe(robots_req, parsed.hostname, self.timeout, on_retry=count_retry,
+                               allow_cross_host_redirect=allow_registered_redirect) as robots_response:
+                    final_robots = urllib.parse.urlparse(robots_response.geturl())
+                    if final_robots.hostname != parsed.hostname and not allow_registered_redirect:
                         raise ValueError("cross-domain robots redirect rejected")
+                    if final_robots.hostname != parsed.hostname:
+                        parsed = urllib.parse.urlparse(urllib.parse.urlunparse((
+                            "https", final_robots.netloc, parsed.path or "/", "", "", ""
+                        )))
+                        url = urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+                        robots_url = robots_response.geturl()
                     robots_body = robots_response.read(100_001)
                     if len(robots_body)>100_000: raise ValueError("robots.txt exceeds 100 KB safety limit")
             except urllib.error.HTTPError as exc:
@@ -629,6 +751,7 @@ class Agent:
             identity_heading = " ".join(p.title + p.h1)
             name_match = legal_name_matches_page(legal_name, page_text, identity_heading)
             org_match = page_has_organisation_number(page_text, org)
+            domain_match = domain_matches_legal_name(parsed.hostname or "", legal_name)
             snap=self.snapshot(org,"website",url,body,{"title":title,"text":page_text[:8000]})
             env["source_snapshots"].append(snap)
             if snap["changed"]: env["changes"].append({"family":"web_presence","source_id":snap["id"],"previous_sha256":snap["previous_sha256"],"sha256":snap["sha256"],"changed_fields":snap["changed_fields"]})
@@ -636,7 +759,7 @@ class Agent:
             profile_excerpt = " Company-site profile links: " + ", ".join(item["url"] for item in profile_links) if profile_links else ""
             ev={"id":snap["id"],"source_id":snap["id"],"excerpt":(title+" — "+page_text[:380]+profile_excerpt)[:600],"claim_fields":["website_url","website_title","website_description","company_profile_url"]}
             env["evidence"].append(ev)
-            if name_match or org_match:
+            if (name_match or org_match) and (not require_domain_name_match or domain_match):
                 facts=[{"field":"website_url","value":url,"evidence_ids":[snap["id"]],"observed_at":snap["retrieved_at"],"valid_at":None},
                        {"field":"website_title","value":title or urllib.parse.urlparse(url).hostname,"evidence_ids":[snap["id"]],"observed_at":snap["retrieved_at"],"valid_at":None}]
                 if p.meta_description: facts.append({"field":"website_description","value":p.meta_description,"evidence_ids":[snap["id"]],"observed_at":snap["retrieved_at"],"valid_at":None})
@@ -666,14 +789,16 @@ class Agent:
                     ats_links.extend(href for href,_caption in job_parser.links)
                     job_title=" ".join(job_parser.h1).strip() or " ".join(job_parser.title).strip()
                     job_words=" ".join(job_parser.text)
-                    accepting=bool(re.search(r"apply(?: now)?|submit (?:your )?application|søk(?: nå| på stillingen)?",job_words,re.I))
-                    closed=bool(re.search(r"position (?:is )?closed|applications? (?:are )?closed|no longer accepting|stillingen er besatt|søknadsfristen er utløpt",job_words,re.I))
-                    if job_title and accepting and not closed:
+                    job_state = classify_job_page(job_words, job_parser.published_dates)
+                    if job_title and (job_state or is_generic_careers_title(job_title)):
                         job_snap=self.snapshot(org,"jobs",job_url,job_body,{"title":job_title,"text":job_words[:3000]})
                         env["source_snapshots"].append(job_snap)
                         if job_snap["changed"]: env["changes"].append({"family":"jobs","source_id":job_snap["id"],"previous_sha256":job_snap["previous_sha256"],"sha256":job_snap["sha256"],"changed_fields":job_snap["changed_fields"]})
-                        env["evidence"].append({"id":job_snap["id"],"source_id":job_snap["id"],"excerpt":(job_title+" — "+job_words[:500])[:600],"claim_fields":["active_job_title"]})
-                        job_facts.append({"field":"active_job_title","value":job_title,"evidence_ids":[job_snap["id"]],"observed_at":job_snap["retrieved_at"],"valid_at":None,"source_url":job_url})
+                        generic_careers = is_generic_careers_title(job_title)
+                        job_field = "careers_page_url" if generic_careers else job_state["field"]
+                        env["evidence"].append({"id":job_snap["id"],"source_id":job_snap["id"],"excerpt":(job_title+" — "+job_words[:500])[:600],"claim_fields":[job_field]})
+                        job_value = job_url if generic_careers else {"title":job_title,"freshness":job_state["freshness"]}
+                        job_facts.append({"field":job_field,"value":job_value,"evidence_ids":[job_snap["id"]],"observed_at":job_snap["retrieved_at"],"valid_at":None if generic_careers else job_state["valid_at"],"source_url":job_url})
                 # Follow only public ATS boards explicitly linked from the company
                 # page already verified against this legal entity. The two-source
                 # evidence chain preserves that relationship and the current listing.
@@ -820,7 +945,10 @@ class Agent:
                         env["evidence"].append({"id": feed_snap["id"], "source_id": feed_snap["id"], "excerpt": "Company-advertised activity feed: " + " | ".join(feed_excerpts)[:550], "claim_fields": ["public_activity"]})
                 claim("public_activity", "available" if activity_facts else "not_available", activity_facts, None if activity_facts else "No dated, entity-matched company news or activity page was verified")
             else:
-                claim("web_presence","ambiguous",reason="Website does not independently identify the exact legal entity")
+                reason = ("Open-web candidate domain did not match a distinctive legal-name token" if
+                          require_domain_name_match and not domain_match else
+                          "Website does not independently identify the exact legal entity")
+                claim("web_presence","ambiguous",reason=reason)
                 claim("jobs","not_available",reason="Website entity match failed; no jobs published")
                 claim("public_activity","not_available",reason="Website entity match failed; no activity published")
         except urllib.error.HTTPError as exc:
@@ -986,15 +1114,26 @@ class Agent:
             cite(latest_activity)
 
         jobs = by_family.get("jobs", {}).get("facts", [])
-        job_titles = []
+        active_job_titles = []
+        undated_job_titles = []
         for fact in jobs:
+            if fact.get("field") == "careers_page_url":
+                cite(fact)
+                continue
             value = fact.get("value")
             title = value.get("title") if isinstance(value, dict) else value
             if isinstance(title, str) and title.strip():
-                job_titles.append(title.strip())
+                if str(fact.get("field") or "").startswith("active_job"):
+                    active_job_titles.append(title.strip())
+                else:
+                    undated_job_titles.append(title.strip())
                 cite(fact)
-        if job_titles:
-            clauses.append("Verified current vacancies include " + ", ".join(dict.fromkeys(job_titles[:3])) + ".")
+        if active_job_titles:
+            clauses.append("Verified current vacancies include " + ", ".join(dict.fromkeys(active_job_titles[:3])) + ".")
+        if undated_job_titles:
+            clauses.append("The verified company website advertises " + ", ".join(dict.fromkeys(undated_job_titles[:3])) + ", but its current publication or deadline date could not be confirmed.")
+        if any(fact.get("field") == "careers_page_url" for fact in jobs):
+            clauses.append("A verified company careers page was found, but it does not establish a current vacancy.")
 
         changes = env.get("changes", [])
         changed_families = sorted({item.get("family") for item in changes if isinstance(item, dict) and item.get("family")})
@@ -1106,6 +1245,8 @@ def main() -> int:
     ap.add_argument("--wikidata-websites",action="store_true",help="Discover website candidates via exact Wikidata P2333 matches, then independently verify each site")
     ap.add_argument("--brave-websites",action="store_true",help="After BRREG and Wikidata find no website, use Brave Search for candidate URLs; requires BRAVE_SEARCH_API_KEY and a Brave plan with storage rights")
     ap.add_argument("--brave-max-requests",type=int,default=600,help="Maximum Brave requests per batch (default: 600; hard cap: 2000)")
+    ap.add_argument("--tinyfish-websites",action="store_true",help="After BRREG and Wikidata find no website, use TinyFish Search for candidate URLs; requires TINYFISH_API_KEY")
+    ap.add_argument("--tinyfish-max-requests",type=int,default=600,help="Maximum TinyFish Search requests per batch (default: 600; hard cap: 2000)")
     ap.add_argument("--llm-summary",action="store_true",help="Opt in to an API-key-gated evidence-grounded summary; invalid output falls back to the deterministic summary")
     args=ap.parse_args()
     if args.workers < 1 or args.workers > 16:
@@ -1116,8 +1257,14 @@ def main() -> int:
         ap.error("--brave-websites requires website fetching; remove --no-website")
     if args.brave_websites and not args.wikidata_websites:
         ap.error("--brave-websites runs only after Wikidata; include --wikidata-websites")
+    if args.tinyfish_websites and args.no_website:
+        ap.error("--tinyfish-websites requires website fetching; remove --no-website")
+    if args.tinyfish_websites and not args.wikidata_websites:
+        ap.error("--tinyfish-websites runs only after Wikidata; include --wikidata-websites")
     if args.brave_websites and not 1 <= args.brave_max_requests <= 2000:
         ap.error("--brave-max-requests must be between 1 and 2000")
+    if args.tinyfish_websites and not 1 <= args.tinyfish_max_requests <= 2000:
+        ap.error("--tinyfish-max-requests must be between 1 and 2000")
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         ap.error("--timeout must be a positive finite number")
     resolved_paths = {"input": args.input.resolve(), "output": args.output.resolve(), "state": args.state.resolve()}
@@ -1145,6 +1292,12 @@ def main() -> int:
             brave = BraveWebsiteDiscovery(timeout=min(args.timeout, 10), max_requests=args.brave_max_requests)
         except Exception as exc:
             ap.error(f"could not enable Brave Search discovery: {exc}")
+    tinyfish = None
+    if args.tinyfish_websites:
+        try:
+            tinyfish = TinyFishWebsiteDiscovery(timeout=min(args.timeout, 15), max_requests=args.tinyfish_max_requests)
+        except Exception as exc:
+            ap.error(f"could not enable TinyFish Search discovery: {exc}")
     summary_agent = None
     if args.llm_summary:
         try:
@@ -1219,6 +1372,87 @@ def main() -> int:
             agent.website(org, candidate["site"], (result.get("identity_anchor") or {}).get("legal_name") or "", result, add_site_claim)
             prior_runtime = result.get("operations", {}).get("runtime_ms", 0)
             agent.finish(result, time.monotonic() - prior_runtime / 1000)
+    tinyfish_report = {"status": "disabled", "requests": 0, "target_count": 0,
+                       "candidate_count": 0, "verified_candidate_count": 0,
+                       "estimated_cost_usd": 0.0, "errors": []}
+    if tinyfish and results:
+        failed_wikidata = set(wikidata_report.get("failed_organisations", []))
+        candidate_count = verified_count = searched = 0
+        for index, original in enumerate(results):
+            org = str(original.get("organisation_number") or "")
+            anchor = original.get("identity_anchor") or {}
+            if anchor.get("status") != "verified" or org in failed_wikidata:
+                continue
+            details = next((item for item in original.get("claims", []) if item.get("family") == "company_details"), {})
+            registered_site = any(fact.get("field") == "website" and fact.get("value")
+                                  for fact in details.get("facts", []))
+            discovery_state = original.get("website_discovery") or {}
+            if registered_site or discovery_state.get("status") != "not_found":
+                continue
+            searched += 1
+            search_result = tinyfish.discover(org, str(anchor.get("legal_name") or ""))
+            attempted_web_requests = 0
+            verified_trial = None
+            ambiguous_candidate = blocked_candidate = False
+            candidate_count += len(search_result.get("candidate_urls", []))
+            for candidate_url in search_result.get("candidate_urls", []):
+                trial = copy.deepcopy(original)
+                trial["claims"] = [item for item in trial.get("claims", [])
+                                   if item.get("family") not in {"web_presence", "jobs", "public_activity"}]
+                def add_tinyfish_claim(family: str, status: str, facts: list[dict[str, Any]] | None = None,
+                                       reason: str | None = None, _trial: dict[str, Any] = trial) -> None:
+                    _trial.setdefault("claims", []).append({"family": family, "status": status,
+                        "facts": facts or [], **({"reason": reason} if reason else {})})
+                before_requests = trial.get("operations", {}).get("requests", 0)
+                # Search candidates do not receive registered-site redirect
+                # privileges; they must stay on the candidate host and pass the
+                # normal exact-company page check.
+                agent.website(org, candidate_url, str(anchor.get("legal_name") or ""), trial, add_tinyfish_claim,
+                              require_domain_name_match=True)
+                attempted_web_requests += max(0, trial.get("operations", {}).get("requests", 0) - before_requests)
+                web_claim = next((item for item in trial.get("claims", []) if item.get("family") == "web_presence"), {})
+                if web_claim.get("status") == "available":
+                    verified_trial = trial
+                    break
+                ambiguous_candidate = ambiguous_candidate or web_claim.get("status") == "ambiguous"
+                blocked_candidate = blocked_candidate or web_claim.get("status") == "blocked"
+            target = verified_trial if verified_trial is not None else original
+            target.setdefault("website_discovery", {}).update({
+                "tinyfish_status": ("candidate_verified" if verified_trial is not None else
+                                    "candidate_unverified" if search_result.get("candidate_urls") else search_result.get("status")),
+                "tinyfish_method": "tinyfish_org_number_then_legal_name_candidate_search",
+                "tinyfish_requests": search_result.get("requests", 0),
+                "tinyfish_estimated_cost_usd": 0.0,
+                "candidate_urls_retained": False,
+            })
+            if verified_trial is not None:
+                target["website_discovery"]["status"] = "verified_candidate"
+            base_requests = original.get("operations", {}).get("requests", 0)
+            target.setdefault("operations", {})["requests"] = base_requests + search_result.get("requests", 0) + attempted_web_requests
+            target["operations"]["tinyfish_search_estimated_cost_usd"] = 0.0
+            if verified_trial is not None:
+                verified_count += 1
+                prior_runtime = target.get("operations", {}).get("runtime_ms", 0)
+                agent.finish(target, time.monotonic() - prior_runtime / 1000)
+            elif search_result.get("candidate_urls"):
+                for item in target.get("claims", []):
+                    if item.get("family") == "web_presence":
+                        item["status"] = "not_available"
+                        item["reason"] = "TinyFish returned candidate pages, but none passed company-ownership and exact-entity verification"
+                    elif item.get("family") in {"jobs", "public_activity"}:
+                        item["status"] = "not_available"
+                        item["reason"] = "No verified company website was available for this lookup"
+                if not ambiguous_candidate and not blocked_candidate:
+                    target.setdefault("errors", []).append({"type": "tinyfish_candidate_verification_failed", "message": "Candidate pages could not be safely verified; no candidate facts were published"})
+                prior_runtime = target.get("operations", {}).get("runtime_ms", 0)
+                agent.finish(target, time.monotonic() - prior_runtime / 1000)
+            results[index] = target
+        tinyfish_report = {"status": "complete" if not tinyfish.errors else "partial" if tinyfish.requests else "failed",
+                           "requests": tinyfish.requests, "target_count": searched,
+                           "candidate_count": candidate_count, "verified_candidate_count": verified_count,
+                           "estimated_cost_usd": 0.0, "candidate_urls_retained": False,
+                           "pricing_note": "Search was documented as free at implementation time; verify current provider terms.",
+                           "errors": tinyfish.errors}
     brave_report = {"status": "disabled", "requests": 0, "target_count": 0,
                     "candidate_count": 0, "verified_candidate_count": 0,
                     "estimated_cost_usd": 0.0, "errors": []}
@@ -1254,7 +1488,8 @@ def main() -> int:
                     _trial.setdefault("claims", []).append({"family": family, "status": status,
                         "facts": facts or [], **({"reason": reason} if reason else {})})
                 before_requests = trial.get("operations", {}).get("requests", 0)
-                agent.website(org, candidate_url, str(anchor.get("legal_name") or ""), trial, add_candidate_claim)
+                agent.website(org, candidate_url, str(anchor.get("legal_name") or ""), trial, add_candidate_claim,
+                              require_domain_name_match=True)
                 used_requests = trial.get("operations", {}).get("requests", 0) - before_requests
                 attempted_web_requests += max(0, used_requests)
                 web_claim = next((item for item in trial.get("claims", []) if item.get("family") == "web_presence"), {})
@@ -1289,12 +1524,10 @@ def main() -> int:
             elif search_result.get("candidate_urls"):
                 for item in target.get("claims", []):
                     if item.get("family") == "web_presence":
-                        item["status"] = "ambiguous" if ambiguous_candidate else "blocked" if blocked_candidate else "failed"
-                        item["reason"] = ("Brave returned candidate pages, but none passed exact-company identity verification" if ambiguous_candidate
-                                           else "Candidate pages were blocked by their access policy" if blocked_candidate
-                                           else "Brave candidate pages could not be fetched and verified")
+                        item["status"] = "not_available"
+                        item["reason"] = "Brave returned candidate pages, but none passed company-ownership and exact-entity verification"
                     elif item.get("family") in {"jobs", "public_activity"}:
-                        item["status"] = "not_available" if ambiguous_candidate else "blocked" if blocked_candidate else "failed"
+                        item["status"] = "not_available"
                         item["reason"] = "No verified company website was available for this lookup"
                 if not ambiguous_candidate:
                     if not blocked_candidate:
@@ -1397,7 +1630,10 @@ def main() -> int:
             bucket=families.setdefault(c.get("family","unknown"),{})
             status=c.get("status","unknown"); bucket[status]=bucket.get(status,0)+1
     estimate_total = sum((row.get("operations") or {}).get("third_party_cost_estimate_usd", 0.0) or 0.0 for row in read_jsonl_records(args.output))
-    report={"input_count":len(orgs),"output_count":n,"unique_input_count":len(set(orgs)),"all_inputs_have_terminal_result":n==len(orgs),"identity_status_counts":states,"family_status_counts":families,"requests":requests,"nav_job_feed":nav_report,"wikidata_website_discovery":wikidata_report,"brave_website_discovery":brave_report,"llm_summary":llm_summary_report,"runtime_ms_sum":runtime,"wall_runtime_ms":int((time.monotonic()-started_batch)*1000),"workers":1 if judge else args.workers,"errors":errors,"third_party_cost_usd":round(costs,6) if cost_known else None,"third_party_cost_estimate_usd":round(estimate_total,8),"third_party_cost_status":"measured" if cost_known else "provider charge unavailable; see estimate and usage records","cost_basis":"default run makes no paid calls; optional Brave/OpenAI costs are estimates from published rates and response usage, not billing records","output":str(args.output),"dashboard":str(dashboard)}
+    cost_status = ("provider charge unavailable; see estimate and usage records" if not cost_known else
+                   "provider-published free tier; billing not independently verified" if tinyfish_report.get("requests", 0) else
+                   "no paid provider calls")
+    report={"input_count":len(orgs),"output_count":n,"unique_input_count":len(set(orgs)),"all_inputs_have_terminal_result":n==len(orgs),"identity_status_counts":states,"family_status_counts":families,"requests":requests,"nav_job_feed":nav_report,"wikidata_website_discovery":wikidata_report,"tinyfish_website_discovery":tinyfish_report,"brave_website_discovery":brave_report,"llm_summary":llm_summary_report,"runtime_ms_sum":runtime,"wall_runtime_ms":int((time.monotonic()-started_batch)*1000),"workers":1 if judge else args.workers,"errors":errors,"third_party_cost_usd":round(costs,6) if cost_known else None,"third_party_cost_estimate_usd":round(estimate_total,8),"third_party_cost_status":cost_status,"cost_basis":"default run makes no paid calls; TinyFish Search was documented as free when integrated; optional Brave/OpenAI costs are estimates from published rates and response usage, not billing records","output":str(args.output),"dashboard":str(dashboard)}
     args.output.with_suffix(args.output.suffix+".report.json").write_text(json.dumps(report,indent=2,ensure_ascii=False)+"\n",encoding="utf-8")
     print(json.dumps(report,ensure_ascii=False))
     return 0

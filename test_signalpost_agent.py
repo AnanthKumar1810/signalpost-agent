@@ -193,8 +193,27 @@ class AgentTests(unittest.TestCase):
             self.agent.website("923609016","https://example.no","Example AS",env,lambda *a,**k:claims.append((a,k)))
         jobs=next(row for row in claims if row[0][0]=="jobs")
         self.assertEqual(jobs[0][1],"available")
-        self.assertEqual(jobs[0][2][0]["value"],"Software Engineer")
+        self.assertEqual(jobs[0][2][0]["field"],"advertised_job_title")
+        self.assertEqual(jobs[0][2][0]["value"],{"title":"Software Engineer","freshness":"unconfirmed"})
         self.assertTrue(jobs[0][2][0]["evidence_ids"])
+
+    def test_dated_job_page_can_be_called_active(self):
+        self.assertTrue(sp.is_generic_careers_title("Ledige stillinger"))
+        self.assertTrue(sp.is_generic_careers_title("Job Openings"))
+        self.assertFalse(sp.is_generic_careers_title("Software Engineer"))
+        result = sp.classify_job_page(
+            "Published 2026-10-01. Apply now for this role.", [],
+            reference_date=__import__("datetime").date(2026, 10, 19),
+        )
+        self.assertEqual(result, {"field":"active_job_title","freshness":"confirmed","valid_at":"2026-10-01"})
+
+    def test_expired_or_stale_job_page_is_not_called_current(self):
+        today = __import__("datetime").date(2026, 10, 19)
+        self.assertIsNone(sp.classify_job_page("Application deadline 2026-10-01. Applications are closed. Apply now.", [], today))
+        self.assertIsNone(sp.classify_job_page("Published 2026-09-01. Application deadline 2026-10-01. Apply now.", [], today))
+        stale = sp.classify_job_page("Published 2020-01-01. Apply now.", [], today)
+        self.assertEqual(stale["field"], "advertised_job_title")
+        self.assertEqual(stale["freshness"], "unconfirmed")
 
     def test_website_http_error_terminates_all_site_families(self):
         class Headers:
@@ -289,6 +308,13 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(sp.page_has_organisation_number("Org.nr. 923 609 016", "923609016"))
         self.assertTrue(sp.page_has_organisation_number("Org.nr: 923-609-016", "923609016"))
         self.assertFalse(sp.page_has_organisation_number("Org.nr. 923 609 017", "923609016"))
+
+    def test_open_web_candidate_domain_must_match_distinctive_name(self):
+        self.assertTrue(sp.domain_matches_legal_name("vvscompaniet.no", "VVS COMPANIET AS"))
+        self.assertTrue(sp.domain_matches_legal_name("www.vvscompaniet.no", "VVS COMPANIET AS"))
+        self.assertTrue(sp.domain_matches_legal_name("arena-trondheim.no", "ARENA TRONDHEIM AS"))
+        self.assertFalse(sp.domain_matches_legal_name("forvalt.no", "ARV INVEST AS"))
+        self.assertFalse(sp.domain_matches_legal_name("1850.no", "TU SAMDRIFT DA"))
 
     def test_private_host_is_rejected(self):
         self.assertFalse(sp.public_host("127.0.0.1"))

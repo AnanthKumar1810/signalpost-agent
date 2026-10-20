@@ -1,0 +1,94 @@
+{
+  "input_count": 10,
+  "output_count": 10,
+  "unique_input_count": 10,
+  "all_inputs_have_terminal_result": true,
+  "identity_status_counts": {
+    "verified": 10
+  },
+  "family_status_counts": {
+    "company_details": {
+      "available": 10
+    },
+    "locations": {
+      "available": 10
+    },
+    "people": {
+      "available": 10
+    },
+    "financials": {
+      "available": 9,
+      "failed": 1
+    },
+    "web_presence": {
+      "ambiguous": 7,
+      "failed": 1,
+      "blocked": 1,
+      "available": 1
+    },
+    "jobs": {
+      "not_available": 7,
+      "failed": 1,
+      "blocked": 1,
+      "available": 1
+    },
+    "public_activity": {
+      "not_available": 8,
+      "failed": 1,
+      "blocked": 1
+    }
+  },
+  "requests": 81,
+  "nav_job_feed": {
+    "status": "disabled",
+    "requests": 0,
+    "matched_profiles": 0
+  },
+  "wikidata_website_discovery": {
+    "status": "complete",
+    "requests": 1,
+    "target_count": 8,
+    "candidate_count": 0,
+    "failed_organisations": [],
+    "errors": [],
+    "identity_rule": "Wikidata P2333 exactly equals requested organisation number; P856 is only a candidate, and fetched page still needs independent identity verification.",
+    "license": "Wikidata structured data (CC0)"
+  },
+  "tinyfish_website_discovery": {
+    "status": "complete",
+    "requests": 8,
+    "target_count": 8,
+    "candidate_count": 21,
+    "verified_candidate_count": 0,
+    "estimated_cost_usd": 0.0,
+    "candidate_urls_retained": false,
+    "pricing_note": "Search was documented as free at implementation time; verify current provider terms.",
+    "errors": []
+  },
+  "brave_website_discovery": {
+    "status": "disabled",
+    "requests": 0,
+    "target_count": 0,
+    "candidate_count": 0,
+    "verified_candidate_count": 0,
+    "estimated_cost_usd": 0.0,
+    "errors": []
+  },
+  "llm_summary": {
+    "status": "disabled",
+    "calls": 0,
+    "accepted": 0,
+    "rejected_or_failed": 0,
+    "estimated_cost_usd": 0.0
+  },
+  "runtime_ms_sum": 49589,
+  "wall_runtime_ms": 121854,
+  "workers": 4,
+  "errors": 2,
+  "third_party_cost_usd": 0.0,
+  "third_party_cost_estimate_usd": 0.0,
+  "third_party_cost_status": "measured",
+  "cost_basis": "default run makes no paid calls; TinyFish Search was documented as free when integrated; optional Brave/OpenAI costs are estimates from published rates and response usage, not billing records",
+  "output": "outputs\\tinyfish-10-company-test\\integrated-live-hardened.jsonl",
+  "dashboard": "outputs\\tinyfish-10-company-test\\integrated-live-hardened.jsonl.html"
+}
