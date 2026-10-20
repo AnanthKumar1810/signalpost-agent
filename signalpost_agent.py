@@ -618,7 +618,21 @@ class Agent:
             env["evidence"].append({"id": snap["id"], "source_id": snap["id"], "excerpt": "BRREG annual-account key figures matched to the requested organisation number", "claim_fields": sorted({fact["field"] for fact in facts})})
             claim("financials", "available" if facts else "not_available", facts, None if facts else "No public key figures were returned for this entity")
         except urllib.error.HTTPError as exc:
-            env["errors"].append({"source": url, "type": "http_error", "status": exc.code, "message": str(exc)})
+            try:
+                response_body = exc.read(32_768).decode("utf-8", errors="replace")
+            except Exception:
+                response_body = ""
+            unsupported_ideell_plan = (
+                exc.code == 500
+                and re.search(r"oppstillingsplan.{0,80}ikke er st[oø]ttet.{0,20}IDEELL", response_body, re.I)
+            )
+            error = {"source": url, "type": "http_error", "status": exc.code, "message": str(exc)}
+            if response_body:
+                error["response_message"] = response_body[:1000]
+            env["errors"].append(error)
+            if unsupported_ideell_plan:
+                claim("financials", "not_applicable", reason="BRREG reports an unsupported IDEELL accounting presentation plan for this entity")
+                return
             status = "blocked" if exc.code in (401, 403, 429) else "not_available" if exc.code in (404, 410) else "failed"
             claim("financials", status, reason=f"Financial register returned HTTP {exc.code}")
         except Exception as exc:

@@ -1,4 +1,5 @@
 import json
+import io
 import tempfile
 import unittest
 import urllib.error
@@ -52,13 +53,23 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(financial[0][1], "not_available")
         self.assertEqual(financial[0][2], [])
 
-    def test_financial_http_500_remains_failed_without_evidence_of_form_exclusion(self):
-        # The current live failure is a foundation (STI). An HTTP 500 does not
-        # prove that the accounts question is not applicable to this form.
-        exc = urllib.error.HTTPError(f"{sp.ACCOUNTS}/987441623", 500, "Internal Server Error", {}, None)
+    def test_financial_unsupported_ideell_plan_is_not_applicable(self):
+        body = b'{"message":"Regnskapet inneholder en oppstillingsplan som ikke er stottet (IDEELL)"}'
+        exc = urllib.error.HTTPError(f"{sp.ACCOUNTS}/987441623", 500, "Internal Server Error", {}, io.BytesIO(body))
         with patch.object(sp, "get_json", side_effect=exc):
             env = {"identity_anchor": {"organisation_form": "STI"}, "operations": {"requests": 0},
                    "source_snapshots": [], "evidence": [], "errors": [], "changes": []}
+            claims = []
+            self.agent.financials("987441623", env, lambda *args, **kwargs: claims.append((args, kwargs)))
+        financial = next(item for item in claims if item[0][0] == "financials")
+        self.assertEqual(financial[0][1], "not_applicable")
+        self.assertIn("IDEELL accounting presentation plan", financial[1]["reason"])
+        self.assertIn("IDEELL", env["errors"][0]["response_message"])
+
+    def test_generic_financial_http_500_remains_failed(self):
+        exc = urllib.error.HTTPError(f"{sp.ACCOUNTS}/987441623", 500, "Internal Server Error", {}, io.BytesIO(b'{"message":"internal server error"}'))
+        with patch.object(sp, "get_json", side_effect=exc):
+            env = {"operations": {"requests": 0}, "source_snapshots": [], "evidence": [], "errors": [], "changes": []}
             claims = []
             self.agent.financials("987441623", env, lambda *args, **kwargs: claims.append((args, kwargs)))
         financial = next(item for item in claims if item[0][0] == "financials")
