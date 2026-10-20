@@ -50,6 +50,13 @@ Rules you must follow exactly:
 8. Every factual claim you make must be traceable to a field in the input.
    Do not write a sentence you could not point to a specific field for.
 
+Keep the summary to three or four sentences whenever possible. If categories
+are missing, make the final sentence concise and start it with exactly:
+"The following could not be confirmed:". List every missing category and do
+not add explanations about why it is missing.
+When mentioning a date, preserve the exact YYYY-MM-DD form provided in the
+input; do not spell the day or month as a separate number.
+
 Output: plain text only, no JSON, no markdown formatting."""
 
 
@@ -139,7 +146,8 @@ def _catalog(profile: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, d
                 catalog_fact["value"] = json.loads(_value_text(catalog_fact["value"]))
             catalog.append(catalog_fact)
             refs[ref] = {"evidence_ids": set(evidence_ids),
-                         "value": {"value": catalog_fact["value"], "valid_at": fact.get("valid_at"),
+                         "value": {"value": catalog_fact["value"], "observed_at": fact.get("observed_at"),
+                                   "valid_at": fact.get("valid_at"),
                                    "reporting_period": fact.get("reporting_period")}}
             if len(catalog) >= MAX_FACTS:
                 return catalog, refs
@@ -186,7 +194,8 @@ class LLMSummaryAgent:
 
     @staticmethod
     def _validate(text: Any, catalog: list[dict[str, Any]], refs: dict[str, dict[str, Any]],
-                  expected_unknown_line: str, missing_groups: list[tuple[str, ...]] | None = None) -> tuple[dict[str, Any] | None, str | None]:
+                  expected_unknown_line: str, missing_groups: list[tuple[str, ...]] | None = None,
+                  additional_numeric_values: Any = None) -> tuple[dict[str, Any] | None, str | None]:
         if not isinstance(text, str) or not text.strip():
             return None, "empty_summary"
         clean = text.strip()
@@ -194,7 +203,9 @@ class LLMSummaryAgent:
             return None, "summary_not_plain_prose"
         if "```" in clean or re.search(r"(?m)^\s*(?:[-*]|\d+[.)])\s", clean):
             return None, "summary_not_plain_prose"
-        sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", clean) if part.strip()]
+        # A closing quote or parenthesis commonly sits between a sentence's
+        # punctuation and the following space; include it in the split rule.
+        sentences = [part.strip() for part in re.split(r"(?<=[.!?])[\"'”’»)]*\s+", clean) if part.strip()]
         if not 3 <= len(sentences) <= 5:
             return None, "summary_must_have_three_to_five_sentences"
         if expected_unknown_line:
@@ -216,6 +227,7 @@ class LLMSummaryAgent:
         for ref, metadata in refs.items():
             allowed_numbers.update(_number_tokens(metadata["value"]))
             all_evidence.update(metadata["evidence_ids"])
+        allowed_numbers.update(_number_tokens(additional_numeric_values))
         for sentence in factual_sentences:
             for number in _number_tokens(sentence):
                 if not any(number == allowed or (len(number) >= 4 and number in allowed) for allowed in allowed_numbers):
@@ -267,19 +279,27 @@ class LLMSummaryAgent:
         except Exception as exc:
             return {"status": "failed", "calls_made": 1, "error": type(exc).__name__, "summary": None}
         summary, validation_error = self._validate(model_text, catalog, refs, unknown_line,
-                                                   _missing_family_groups(profile))
+                                                   _missing_family_groups(profile),
+                                                   {"identity_anchor": profile.get("identity_anchor"),
+                                                    "organisation_number": profile.get("organisation_number")})
         if summary is None:
+            usage = response_data.get("usage") or {}
+            estimate = self._estimate_cost(usage, self.model)
             return {"status": "rejected", "calls_made": 1, "error": validation_error, "summary": None,
-                    "model": self.model, "usage": response_data.get("usage")}
+                    "model": self.model, "usage": usage, "estimated_cost_usd": estimate}
         usage = response_data.get("usage") or {}
-        input_tokens = usage.get("input_tokens")
-        output_tokens = usage.get("output_tokens")
-        cost = None
-        if self.model == DEFAULT_MODEL and isinstance(input_tokens, int) and isinstance(output_tokens, int):
-            cost = round(input_tokens * INPUT_USD_PER_MILLION / 1_000_000 +
-                         output_tokens * OUTPUT_USD_PER_MILLION / 1_000_000, 8)
+        cost = self._estimate_cost(usage, self.model)
         summary["model"] = self.model
         summary["usage"] = usage
         summary["estimated_cost_usd"] = cost
         return {"status": "available", "calls_made": 1, "summary": summary,
                 "model": self.model, "usage": usage, "estimated_cost_usd": cost}
+
+    @staticmethod
+    def _estimate_cost(usage: dict[str, Any], model: str) -> float | None:
+        input_tokens = usage.get("input_tokens")
+        output_tokens = usage.get("output_tokens")
+        if model != DEFAULT_MODEL or not isinstance(input_tokens, int) or not isinstance(output_tokens, int):
+            return None
+        return round(input_tokens * INPUT_USD_PER_MILLION / 1_000_000 +
+                     output_tokens * OUTPUT_USD_PER_MILLION / 1_000_000, 8)

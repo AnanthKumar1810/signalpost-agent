@@ -2,7 +2,7 @@ import json
 import unittest
 from unittest.mock import patch
 
-from llm_summary import LLMSummaryAgent, SYSTEM_PROMPT, _catalog, _unknown_line
+from llm_summary import LLMSummaryAgent, SYSTEM_PROMPT, _catalog, _missing_family_groups, _unknown_line
 
 
 def profile():
@@ -109,6 +109,33 @@ class LLMSummaryTests(unittest.TestCase):
         summary, error = LLMSummaryAgent._validate(text, catalog, refs, "")
         self.assertIsNone(error)
         self.assertEqual(len(summary["text"].split(". ")), 3)
+
+    def test_verified_identity_number_is_allowed_as_an_input_supported_number(self):
+        row = profile()
+        catalog, refs = _catalog(row)
+        missing = _unknown_line(row)
+        text = "Example AS, organisation number 923609016, is registered in Oslo. Revenue was NOK 750,000 for 2025. " + missing
+        summary, error = LLMSummaryAgent._validate(
+            text, catalog, refs, missing, additional_numeric_values={
+                "identity_anchor": row["identity_anchor"], "organisation_number": row["organisation_number"]})
+        self.assertIsNone(error)
+        self.assertIsNotNone(summary)
+
+    def test_cost_estimate_is_available_even_when_summary_is_rejected(self):
+        estimate = LLMSummaryAgent._estimate_cost({"input_tokens": 1000, "output_tokens": 100}, "gpt-6-luna")
+        self.assertEqual(estimate, 0.000075)
+
+    def test_sentence_split_handles_a_period_inside_a_quoted_description(self):
+        row = profile()
+        row["claims"].append({"family": "web_presence", "status": "available", "facts": [
+            {"field": "website_description", "value": "Software.", "evidence_ids": ["registry:one"]},
+        ]})
+        catalog, refs = _catalog(row)
+        missing = _unknown_line(row)
+        text = 'Example AS is registered. Its website describes "Software." Revenue was NOK 750,000 for 2025. ' + missing
+        summary, error = LLMSummaryAgent._validate(text, catalog, refs, missing, _missing_family_groups(row))
+        self.assertIsNone(error)
+        self.assertIsNotNone(summary)
 
 
 if __name__ == "__main__":

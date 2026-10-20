@@ -1,0 +1,119 @@
+{
+  "input_count": 1000,
+  "output_count": 1000,
+  "unique_input_count": 1000,
+  "all_inputs_have_terminal_result": true,
+  "identity_status_counts": {
+    "verified": 1000
+  },
+  "family_status_counts": {
+    "company_details": {
+      "available": 1000
+    },
+    "locations": {
+      "available": 998,
+      "not_available": 2
+    },
+    "people": {
+      "available": 999,
+      "failed": 1
+    },
+    "financials": {
+      "available": 993,
+      "failed": 3,
+      "not_available": 2,
+      "not_applicable": 2
+    },
+    "web_presence": {
+      "available": 50,
+      "not_available": 882,
+      "ambiguous": 42,
+      "failed": 23,
+      "blocked": 3
+    },
+    "jobs": {
+      "not_available": 965,
+      "available": 7,
+      "failed": 24,
+      "blocked": 4
+    },
+    "public_activity": {
+      "not_available": 957,
+      "available": 14,
+      "failed": 25,
+      "blocked": 4
+    }
+  },
+  "requests": 4518,
+  "nav_job_feed": {
+    "requests": 28,
+    "matched_profiles": 0,
+    "status": "complete",
+    "truncated": true,
+    "pages_limit": 25,
+    "detail_limit": 100,
+    "lookback_days": 180,
+    "candidate_count": 2
+  },
+  "wikidata_website_discovery": {
+    "status": "complete",
+    "requests": 18,
+    "target_count": 894,
+    "candidate_count": 0,
+    "failed_organisations": [],
+    "errors": [],
+    "identity_rule": "Wikidata P2333 exactly equals requested organisation number; P856 is only a candidate, and fetched page still needs independent identity verification.",
+    "license": "Wikidata structured data (CC0)"
+  },
+  "tinyfish_website_discovery": {
+    "status": "complete",
+    "requests": 50,
+    "target_count": 894,
+    "candidate_count": 7,
+    "verified_candidate_count": 7,
+    "estimated_cost_usd": 0.0,
+    "candidate_urls_retained": false,
+    "pricing_note": "Search was documented as free at implementation time; verify current provider terms.",
+    "errors": []
+  },
+  "tavily_website_discovery": {
+    "status": "partial",
+    "requests": 100,
+    "credits_used": 99,
+    "target_count": 51,
+    "candidate_count": 17,
+    "verified_candidate_count": 5,
+    "estimated_cost_usd": 0.0,
+    "budget_exhausted_targets": 836,
+    "candidate_urls_retained": false,
+    "errors": []
+  },
+  "brave_website_discovery": {
+    "status": "disabled",
+    "requests": 0,
+    "target_count": 0,
+    "candidate_count": 0,
+    "verified_candidate_count": 0,
+    "estimated_cost_usd": 0.0,
+    "errors": []
+  },
+  "llm_summary": {
+    "status": "partial",
+    "calls": 1000,
+    "accepted": 7,
+    "rejected_or_failed": 993,
+    "estimated_cost_usd": null,
+    "model": "gpt-6-luna",
+    "cost_note": "Estimate uses the published GPT-6 Luna input/output rates; refresh model pricing before an official run."
+  },
+  "runtime_ms_sum": 4733890,
+  "wall_runtime_ms": 1384036,
+  "workers": 8,
+  "errors": 39,
+  "third_party_cost_usd": null,
+  "third_party_cost_estimate_usd": 0.0018551,
+  "third_party_cost_status": "provider charge unavailable; see estimate and usage records",
+  "cost_basis": "TinyFish and Tavily usage must be checked against provider free-credit allowances; optional OpenAI and Brave costs are estimates from published rates and response usage, not billing records",
+  "output": "outputs\\submission-1000-integrated-live.jsonl",
+  "dashboard": "outputs\\submission-1000-integrated-live.jsonl.html"
+}

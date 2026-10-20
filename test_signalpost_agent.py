@@ -9,6 +9,25 @@ from unittest.mock import patch
 import signalpost_agent as sp
 
 
+class CandidateVerificationIntegrationTests(unittest.TestCase):
+    def test_verified_discovery_returns_the_enriched_profile_for_output(self):
+        class FakeAgent:
+            def website(self, org, url, legal_name, profile, add_claim, require_domain_name_match=False):
+                self.assert_gate = require_domain_name_match
+                profile.setdefault("operations", {})["requests"] += 1
+                add_claim("web_presence", "available", [{"field": "website", "value": url}])
+
+        original = {"organisation_number": "923609016", "claims": [], "operations": {"requests": 2}}
+        enriched, requests, verified, ambiguous, blocked = sp._verify_discovered_website_candidates(
+            FakeAgent(), original, "923609016", "Nordic Coffee AS", ["https://nordiccoffee.no"])
+        self.assertTrue(verified)
+        self.assertEqual(requests, 1)
+        self.assertFalse(ambiguous)
+        self.assertFalse(blocked)
+        self.assertIsNot(enriched, original)
+        self.assertEqual(enriched["claims"][0]["facts"][0]["value"], "https://nordiccoffee.no")
+
+
 class AgentTests(unittest.TestCase):
     def setUp(self):
         scratch = Path.cwd() / "work"

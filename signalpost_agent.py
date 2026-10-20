@@ -34,6 +34,7 @@ from public_ats import fetch_linked_jobs
 from wikidata_websites import WikidataWebsiteDiscovery
 from brave_websites import BraveWebsiteDiscovery
 from tinyfish_websites import TinyFishWebsiteDiscovery
+from tavily_websites import TavilyWebsiteDiscovery
 from llm_summary import LLMSummaryAgent
 
 BRREG = "https://data.brreg.no/enhetsregisteret/api"
@@ -45,11 +46,38 @@ STATES = {"available", "not_available", "blocked", "not_applicable", "ambiguous"
 FAMILIES = ("company_details", "people", "locations", "financials", "jobs", "public_activity", "web_presence")
 _FIXED_PROVIDER_HOSTS = {
     "data.brreg.no", "query.wikidata.org", "arbeidsplassen.nav.no",
-    "api.search.brave.com", "api.search.tinyfish.ai", "api.openai.com",
+    "api.search.brave.com", "api.search.tinyfish.ai", "api.tavily.com", "api.openai.com",
 }
 _DNS_CACHE: dict[tuple[str, int], tuple[float, list[tuple[Any, ...]]]] = {}
 _DNS_CACHE_LOCK = threading.Lock()
 _DNS_CACHE_TTL_SECONDS = 300
+
+
+def _verify_discovered_website_candidates(agent: Any, original: dict[str, Any], organisation_number: str,
+                                         legal_name: str, candidate_urls: list[str]) -> tuple[dict[str, Any], int, bool, bool, bool]:
+    """Fetch candidate pages through the normal publication gate; return the verified profile itself."""
+    attempted_requests = 0
+    ambiguous = blocked = False
+    for candidate_url in candidate_urls:
+        trial = copy.deepcopy(original)
+        trial["claims"] = [item for item in trial.get("claims", [])
+                           if item.get("family") not in {"web_presence", "jobs", "public_activity"}]
+
+        def add_claim(family: str, status: str, facts: list[dict[str, Any]] | None = None,
+                      reason: str | None = None, _trial: dict[str, Any] = trial) -> None:
+            _trial.setdefault("claims", []).append({"family": family, "status": status,
+                "facts": facts or [], **({"reason": reason} if reason else {})})
+
+        before_requests = trial.get("operations", {}).get("requests", 0)
+        agent.website(organisation_number, candidate_url, legal_name, trial, add_claim,
+                      require_domain_name_match=True)
+        attempted_requests += max(0, trial.get("operations", {}).get("requests", 0) - before_requests)
+        web_claim = next((item for item in trial.get("claims", []) if item.get("family") == "web_presence"), {})
+        if web_claim.get("status") == "available":
+            return trial, attempted_requests, True, ambiguous, blocked
+        ambiguous = ambiguous or web_claim.get("status") == "ambiguous"
+        blocked = blocked or web_claim.get("status") == "blocked"
+    return original, attempted_requests, False, ambiguous, blocked
 
 
 def now() -> str:
@@ -1261,6 +1289,8 @@ def main() -> int:
     ap.add_argument("--brave-max-requests",type=int,default=600,help="Maximum Brave requests per batch (default: 600; hard cap: 2000)")
     ap.add_argument("--tinyfish-websites",action="store_true",help="After BRREG and Wikidata find no website, use TinyFish Search for candidate URLs; requires TINYFISH_API_KEY")
     ap.add_argument("--tinyfish-max-requests",type=int,default=600,help="Maximum TinyFish Search requests per batch (default: 600; hard cap: 2000)")
+    ap.add_argument("--tavily-websites",action="store_true",help="After BRREG, Wikidata and TinyFish find no verified website, use Tavily Search for candidate URLs; requires TAVILY_API_KEY")
+    ap.add_argument("--tavily-max-requests",type=int,default=600,help="Maximum Tavily Search requests per batch (default: 600; hard cap: 2000)")
     ap.add_argument("--llm-summary",action="store_true",help="Opt in to an API-key-gated evidence-grounded summary; invalid output falls back to the deterministic summary")
     args=ap.parse_args()
     if args.workers < 1 or args.workers > 16:
@@ -1275,10 +1305,16 @@ def main() -> int:
         ap.error("--tinyfish-websites requires website fetching; remove --no-website")
     if args.tinyfish_websites and not args.wikidata_websites:
         ap.error("--tinyfish-websites runs only after Wikidata; include --wikidata-websites")
+    if args.tavily_websites and args.no_website:
+        ap.error("--tavily-websites requires website fetching; remove --no-website")
+    if args.tavily_websites and not args.wikidata_websites:
+        ap.error("--tavily-websites runs only after Wikidata; include --wikidata-websites")
     if args.brave_websites and not 1 <= args.brave_max_requests <= 2000:
         ap.error("--brave-max-requests must be between 1 and 2000")
     if args.tinyfish_websites and not 1 <= args.tinyfish_max_requests <= 2000:
         ap.error("--tinyfish-max-requests must be between 1 and 2000")
+    if args.tavily_websites and not 1 <= args.tavily_max_requests <= 2000:
+        ap.error("--tavily-max-requests must be between 1 and 2000")
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         ap.error("--timeout must be a positive finite number")
     resolved_paths = {"input": args.input.resolve(), "output": args.output.resolve(), "state": args.state.resolve()}
@@ -1312,6 +1348,12 @@ def main() -> int:
             tinyfish = TinyFishWebsiteDiscovery(timeout=min(args.timeout, 15), max_requests=args.tinyfish_max_requests)
         except Exception as exc:
             ap.error(f"could not enable TinyFish Search discovery: {exc}")
+    tavily = None
+    if args.tavily_websites:
+        try:
+            tavily = TavilyWebsiteDiscovery(timeout=min(args.timeout, 10), max_requests=args.tavily_max_requests)
+        except Exception as exc:
+            ap.error(f"could not enable Tavily Search discovery: {exc}")
     summary_agent = None
     if args.llm_summary:
         try:
@@ -1467,6 +1509,69 @@ def main() -> int:
                            "estimated_cost_usd": 0.0, "candidate_urls_retained": False,
                            "pricing_note": "Search was documented as free at implementation time; verify current provider terms.",
                            "errors": tinyfish.errors}
+    tavily_report = {"status": "disabled", "requests": 0, "credits_used": 0,
+                     "target_count": 0, "candidate_count": 0,
+                     "verified_candidate_count": 0, "estimated_cost_usd": 0.0, "errors": []}
+    if tavily and results:
+        failed_wikidata = set(wikidata_report.get("failed_organisations", []))
+        candidate_count = verified_count = searched = budget_exhausted_targets = 0
+        for index, original in enumerate(results):
+            org = str(original.get("organisation_number") or "")
+            anchor = original.get("identity_anchor") or {}
+            if anchor.get("status") != "verified" or org in failed_wikidata:
+                continue
+            details = next((item for item in original.get("claims", []) if item.get("family") == "company_details"), {})
+            registered_site = any(fact.get("field") == "website" and fact.get("value")
+                                  for fact in details.get("facts", []))
+            discovery_state = original.get("website_discovery") or {}
+            if registered_site or discovery_state.get("status") != "not_found":
+                continue
+            search_result = tavily.discover(org, str(anchor.get("legal_name") or ""))
+            if search_result.get("requests", 0):
+                searched += 1
+            if search_result.get("status") == "budget_exhausted":
+                budget_exhausted_targets += 1
+            candidate_count += len(search_result.get("candidate_urls", []))
+            target, attempted_web_requests, found_verified, ambiguous_candidate, blocked_candidate = _verify_discovered_website_candidates(
+                agent, original, org, str(anchor.get("legal_name") or ""),
+                search_result.get("candidate_urls", []))
+            verified_trial = target if found_verified else None
+            target = verified_trial if verified_trial is not None else original
+            target.setdefault("website_discovery", {}).update({
+                "tavily_status": ("candidate_verified" if verified_trial is not None else
+                                  "candidate_unverified" if search_result.get("candidate_urls") else search_result.get("status")),
+                "tavily_method": "tavily_org_number_then_legal_name_candidate_search",
+                "tavily_requests": search_result.get("requests", 0),
+                "tavily_credits_used": search_result.get("credits_used", 0),
+                "candidate_urls_retained": False,
+            })
+            base_requests = original.get("operations", {}).get("requests", 0)
+            target.setdefault("operations", {})["requests"] = base_requests + search_result.get("requests", 0) + attempted_web_requests
+            target["operations"]["tavily_search_estimated_cost_usd"] = 0.0
+            if verified_trial is not None:
+                verified_count += 1
+                prior_runtime = target.get("operations", {}).get("runtime_ms", 0)
+                agent.finish(target, time.monotonic() - prior_runtime / 1000)
+            elif search_result.get("candidate_urls"):
+                for item in target.get("claims", []):
+                    if item.get("family") == "web_presence":
+                        item["status"] = "not_available"
+                        item["reason"] = "Tavily returned candidate pages, but none passed company-ownership and exact-entity verification"
+                    elif item.get("family") in {"jobs", "public_activity"}:
+                        item["status"] = "not_available"
+                        item["reason"] = "No verified company website was available for this lookup"
+                if not ambiguous_candidate and not blocked_candidate:
+                    target.setdefault("errors", []).append({"type": "tavily_candidate_verification_failed",
+                        "message": "Candidate pages could not be safely verified; no candidate facts were published"})
+                prior_runtime = target.get("operations", {}).get("runtime_ms", 0)
+                agent.finish(target, time.monotonic() - prior_runtime / 1000)
+            results[index] = target
+        tavily_report = {"status": "partial" if tavily.errors or budget_exhausted_targets else "complete" if tavily.requests else "failed",
+                         "requests": tavily.requests, "credits_used": tavily.credits_used,
+                         "target_count": searched, "candidate_count": candidate_count,
+                         "verified_candidate_count": verified_count, "estimated_cost_usd": 0.0,
+                         "budget_exhausted_targets": budget_exhausted_targets,
+                         "candidate_urls_retained": False, "errors": tavily.errors}
     brave_report = {"status": "disabled", "requests": 0, "target_count": 0,
                     "candidate_count": 0, "verified_candidate_count": 0,
                     "estimated_cost_usd": 0.0, "errors": []}
@@ -1647,7 +1752,7 @@ def main() -> int:
     cost_status = ("provider charge unavailable; see estimate and usage records" if not cost_known else
                    "provider-published free tier; billing not independently verified" if tinyfish_report.get("requests", 0) else
                    "no paid provider calls")
-    report={"input_count":len(orgs),"output_count":n,"unique_input_count":len(set(orgs)),"all_inputs_have_terminal_result":n==len(orgs),"identity_status_counts":states,"family_status_counts":families,"requests":requests,"nav_job_feed":nav_report,"wikidata_website_discovery":wikidata_report,"tinyfish_website_discovery":tinyfish_report,"brave_website_discovery":brave_report,"llm_summary":llm_summary_report,"runtime_ms_sum":runtime,"wall_runtime_ms":int((time.monotonic()-started_batch)*1000),"workers":1 if judge else args.workers,"errors":errors,"third_party_cost_usd":round(costs,6) if cost_known else None,"third_party_cost_estimate_usd":round(estimate_total,8),"third_party_cost_status":cost_status,"cost_basis":"default run makes no paid calls; TinyFish Search was documented as free when integrated; optional Brave/OpenAI costs are estimates from published rates and response usage, not billing records","output":str(args.output),"dashboard":str(dashboard)}
+    report={"input_count":len(orgs),"output_count":n,"unique_input_count":len(set(orgs)),"all_inputs_have_terminal_result":n==len(orgs),"identity_status_counts":states,"family_status_counts":families,"requests":requests,"nav_job_feed":nav_report,"wikidata_website_discovery":wikidata_report,"tinyfish_website_discovery":tinyfish_report,"tavily_website_discovery":tavily_report,"brave_website_discovery":brave_report,"llm_summary":llm_summary_report,"runtime_ms_sum":runtime,"wall_runtime_ms":int((time.monotonic()-started_batch)*1000),"workers":1 if judge else args.workers,"errors":errors,"third_party_cost_usd":round(costs,6) if cost_known else None,"third_party_cost_estimate_usd":round(estimate_total,8),"third_party_cost_status":cost_status,"cost_basis":"TinyFish and Tavily usage must be checked against provider free-credit allowances; optional OpenAI and Brave costs are estimates from published rates and response usage, not billing records","output":str(args.output),"dashboard":str(dashboard)}
     args.output.with_suffix(args.output.suffix+".report.json").write_text(json.dumps(report,indent=2,ensure_ascii=False)+"\n",encoding="utf-8")
     print(json.dumps(report,ensure_ascii=False))
     return 0
