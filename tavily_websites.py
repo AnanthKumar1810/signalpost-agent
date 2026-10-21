@@ -15,6 +15,7 @@ from typing import Any
 
 from tinyfish_websites import _domain_matches_name, _is_directory
 from wikidata_websites import normalize_site_url
+from request_budget import consume_request
 
 ENDPOINT = "https://api.tavily.com/search"
 API_HOST = "api.tavily.com"
@@ -112,6 +113,7 @@ class TavilyWebsiteDiscovery:
         )
         self.requests += 1
         try:
+            consume_request("Tavily Search")
             with urllib.request.build_opener(_FixedHostRedirect()).open(request, timeout=self.timeout) as response:
                 if urllib.parse.urlsplit(response.geturl()).hostname != API_HOST:
                     raise ValueError("Tavily Search response came from an unexpected host")
@@ -133,11 +135,10 @@ class TavilyWebsiteDiscovery:
             return {"status": "budget_exhausted", "candidate_urls": [], "requests": 0,
                     "credits_used": 0, "reason": "Tavily request budget is exhausted"}
         candidates = self._search(f'"{org}"')
-        candidates = [url for url in candidates if _domain_matches_name(url, legal_name)]
         if (not candidates and len(self.errors) == start_errors and legal_name.strip()
                 and self.requests < self.max_requests):
             candidates = self._search(f'"{legal_name.strip()}"')
-            candidates = [url for url in candidates if _domain_matches_name(url, legal_name)]
+        candidates.sort(key=lambda url: (not _domain_matches_name(url, legal_name), url))
         return {
             "status": "candidate_found" if candidates else "failed" if len(self.errors) > start_errors else "not_found",
             "candidate_urls": candidates,

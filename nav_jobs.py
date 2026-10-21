@@ -11,6 +11,7 @@ import urllib.request
 import unicodedata
 from collections import defaultdict
 from typing import Any
+from request_budget import consume_request
 
 BASE = "https://pam-stilling-feed.nav.no"
 UA = "SignalpostResearchAgent/0.3 (public NAV job feed)"
@@ -33,6 +34,23 @@ def _name_key(value: Any) -> str:
     while tokens and tokens[-1] in {"as", "asa", "nuf", "da", "ans", "sa", "ba", "enk"}:
         tokens.pop()
     return " ".join(tokens)
+
+
+def _name_is_candidate(feed_name: Any, legal_key: str) -> bool:
+    """Loose prefilter to fetch candidate detail only; never publishes a job.
+
+    Final attribution still requires the exact organisation number in the NAV
+    detail, or the existing exact-name plus location/homepage corroboration.
+    """
+    candidate = _name_key(feed_name)
+    if not candidate or not legal_key:
+        return False
+    if candidate == legal_key:
+        return True
+    target_tokens, candidate_tokens = set(legal_key.split()), set(candidate.split())
+    shared = target_tokens & candidate_tokens
+    distinctive = {token for token in target_tokens if len(token) >= 5}
+    return bool(shared & distinctive) and len(shared) / max(1, len(target_tokens)) >= 0.5
 
 
 class NavJobFeed:
@@ -58,6 +76,7 @@ class NavJobFeed:
             headers["If-Modified-Since"] = modified_since
         req = urllib.request.Request(url, headers=headers)
         self.requests += 1
+        consume_request("NAV public feed")
         opener = urllib.request.build_opener(_NavRedirect())
         with opener.open(req, timeout=self.timeout) as response:
             raw = response.read(2_000_001)
@@ -117,6 +136,7 @@ class NavJobFeed:
             since = email.utils.format_datetime(dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=self.lookback_days), usegmt=True)
             feed_url = BASE + "/api/v1/feed"
             candidates: dict[str, dict[str, Any]] = {}
+            active_feed_entries = 0
             for _ in range(self.max_pages):
                 _raw, page = self._get(feed_url, token, since)
                 if not isinstance(page, dict) or not isinstance(page.get("items"), list):
@@ -127,8 +147,16 @@ class NavJobFeed:
                     header = item.get("_feed_entry") or {}
                     if header.get("status") != "ACTIVE":
                         continue
+                    active_feed_entries += 1
                     key = _name_key(header.get("businessName"))
-                    for org in by_name.get(key, []):
+                    # Exact names are cheapest. Similar names are fetched only
+                    # as bounded candidates because the detail must then prove
+                    # the exact org number before it is published.
+                    possible_orgs = list(by_name.get(key, []))
+                    if not possible_orgs:
+                        possible_orgs = [org for org, target in targets.items()
+                                         if _name_is_candidate(key, target["key"])]
+                    for org in possible_orgs:
                         candidates.setdefault(str(header.get("uuid") or item.get("id") or ""), {"org": org, "url": item.get("url"), "header": header})
                 next_url = page.get("next_url")
                 if not next_url:
@@ -143,6 +171,8 @@ class NavJobFeed:
 
             by_org: dict[str, list[dict[str, Any]]] = defaultdict(list)
             detail_count = 0
+            entity_mismatches = 0
+            expired_or_undated = 0
             for candidate in candidates.values():
                 if detail_count >= self.max_details:
                     self.truncated = True
@@ -153,9 +183,9 @@ class NavJobFeed:
                     continue
                 try:
                     _raw, detail = self._get(detail_url, token)
-                    detail_count += 1
                 except Exception:
                     continue
+                detail_count += 1
                 if not isinstance(detail, dict) or detail.get("status") != "ACTIVE":
                     continue
                 ad = detail.get("ad_content") or detail.get("json") or {}
@@ -171,8 +201,10 @@ class NavJobFeed:
                 homepage_matches = bool(target["host"] and self._host(employer.get("homepage")) == target["host"])
                 if employer_org:
                     if employer_org != org:
+                        entity_mismatches += 1
                         continue
                 elif not (employer_name_matches and (location_matches or homepage_matches)):
+                    entity_mismatches += 1
                     continue
                 expires = ad.get("expires")
                 try:
@@ -180,8 +212,10 @@ class NavJobFeed:
                     if expiry.tzinfo is None:
                         expiry = expiry.replace(tzinfo=dt.timezone.utc)
                     if expiry <= dt.datetime.now(dt.timezone.utc):
+                        expired_or_undated += 1
                         continue
                 except (TypeError, ValueError):
+                    expired_or_undated += 1
                     continue
                 title = ad.get("jobtitle") or ad.get("title") or candidate["header"].get("title")
                 if not isinstance(title, str) or not title.strip():
@@ -217,7 +251,9 @@ class NavJobFeed:
                         profile.setdefault("claims", []).append({"family": "jobs", "status": "available", "facts": facts})
             return {"requests": self.requests, "matched_profiles": matched, "status": "complete", "truncated": self.truncated,
                     "pages_limit": self.max_pages, "detail_limit": self.max_details, "lookback_days": self.lookback_days,
-                    "candidate_count": len(candidates)}
+                    "active_feed_entries_seen": active_feed_entries, "candidate_details_queued": len(candidates),
+                    "details_fetched": detail_count, "entity_mismatches": entity_mismatches,
+                    "expired_or_undated_details": expired_or_undated}
         except Exception as exc:
             self.error = f"{type(exc).__name__}: {exc}"
             return {"requests": self.requests, "matched_profiles": 0, "status": "failed", "error": self.error}

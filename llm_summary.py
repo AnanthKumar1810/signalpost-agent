@@ -4,9 +4,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import urllib.error
 import urllib.request
 from typing import Any
+from request_budget import consume_request
 
 API = "https://api.openai.com/v1/responses"
 DEFAULT_MODEL = "gpt-6-luna"
@@ -191,6 +193,8 @@ class LLMSummaryAgent:
             raise ValueError("OPENAI_API_KEY is required to enable LLM summaries")
         self.model = model or os.environ.get("SIGNALPOST_SUMMARY_MODEL", DEFAULT_MODEL)
         self.timeout = timeout
+        self._request_lock = threading.Lock()
+        self._rate_limited = False
 
     @staticmethod
     def _validate(text: Any, catalog: list[dict[str, Any]], refs: dict[str, dict[str, Any]],
@@ -222,19 +226,37 @@ class LLMSummaryAgent:
             factual_sentences = sentences
         if not factual_sentences:
             return None, "summary_has_no_factual_sentences"
-        allowed_numbers: set[str] = set()
-        all_evidence: set[str] = set()
-        for ref, metadata in refs.items():
-            allowed_numbers.update(_number_tokens(metadata["value"]))
-            all_evidence.update(metadata["evidence_ids"])
-        allowed_numbers.update(_number_tokens(additional_numeric_values))
+        org_number = (additional_numeric_values.get("organisation_number")
+                      if isinstance(additional_numeric_values, dict) else None)
+        org_number = re.sub(r"\D", "", str(org_number or ""))
+        stop_words = {"the", "is", "as", "in", "on", "for", "and", "or", "of", "to", "its", "it", "was", "were", "are", "a", "an", "by", "from", "with", "company", "reports", "reported", "listed", "registered"}
+        def terms(value: Any) -> set[str]:
+            return {token for token in re.findall(r"[a-z0-9]+", _value_text(value).casefold())
+                    if len(token) > 1 and token not in stop_words}
+        fact_terms = {ref: terms(metadata["value"]) for ref, metadata in refs.items()}
+        sentence_refs: list[list[str]] = []
         for sentence in factual_sentences:
+            sentence_terms = terms(sentence)
+            matched_refs = sorted(ref for ref, catalog_terms in fact_terms.items()
+                                  if sentence_terms & catalog_terms)
+            if not matched_refs:
+                return None, "unsupported_factual_sentence"
             for number in _number_tokens(sentence):
-                if not any(number == allowed or (len(number) >= 4 and number in allowed) for allowed in allowed_numbers):
+                supported_here = set().union(*(_number_tokens(refs[ref]["value"]) for ref in matched_refs))
+                # The registered org number is the only non-claim number that
+                # may be stated, and only when the sentence itself includes it.
+                if org_number and re.search(r"\b(?:organisation|organization|org\.?)\s*(?:number|nr|no)\b", sentence, re.I):
+                    supported_here.add(org_number)
+                if not any(number == allowed or (len(number) >= 4 and number in allowed) for allowed in supported_here):
                     return None, "unsupported_numeric_value"
-        # Retain a local provenance catalog alongside free prose. This is a
-        # review aid, not a claim that semantic grounding can be mechanically proven.
-        claim_map = [{"text": sentence, "field_refs": sorted(refs)} for sentence in factual_sentences]
+            sentence_refs.append(matched_refs)
+        # Token-level matching is a conservative provenance filter, not proof
+        # of full semantic entailment. Keep sentence-specific references so a
+        # reviewer can inspect what the summary sentence was based on.
+        claim_map = [{"text": sentence, "field_refs": sentence_refs[index]}
+                     for index, sentence in enumerate(factual_sentences)]
+        all_evidence = {evidence_id for field_refs in sentence_refs for ref in field_refs
+                        for evidence_id in refs[ref]["evidence_ids"]}
         return {
             "text": clean,
             "evidence_ids": sorted(all_evidence),
@@ -269,15 +291,25 @@ class LLMSummaryAgent:
         request = urllib.request.Request(API, data=body, headers={
             "Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json",
         }, method="POST")
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                raw = response.read(MAX_RESPONSE_BYTES + 1)
-            if len(raw) > MAX_RESPONSE_BYTES:
-                return {"status": "failed", "calls_made": 1, "error": "response_too_large", "summary": None}
-            response_data = json.loads(raw)
-            model_text = _output_text(response_data)
-        except Exception as exc:
-            return {"status": "failed", "calls_made": 1, "error": type(exc).__name__, "summary": None}
+        with self._request_lock:
+            if self._rate_limited:
+                return {"status": "circuit_open", "calls_made": 0, "error": "previous_request_rate_limited", "summary": None}
+            try:
+                consume_request("OpenAI summary")
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    raw = response.read(MAX_RESPONSE_BYTES + 1)
+                if len(raw) > MAX_RESPONSE_BYTES:
+                    return {"status": "failed", "calls_made": 1, "error": "response_too_large", "summary": None}
+                response_data = json.loads(raw)
+                model_text = _output_text(response_data)
+            except urllib.error.HTTPError as exc:
+                if exc.code == 429:
+                    self._rate_limited = True
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                return {"status": "failed", "calls_made": 1, "error": f"http_{exc.code}",
+                        "http_status": exc.code, "retry_after": retry_after, "summary": None}
+            except Exception as exc:
+                return {"status": "failed", "calls_made": 1, "error": type(exc).__name__, "summary": None}
         summary, validation_error = self._validate(model_text, catalog, refs, unknown_line,
                                                    _missing_family_groups(profile),
                                                    {"identity_anchor": profile.get("identity_anchor"),

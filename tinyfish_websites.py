@@ -15,6 +15,7 @@ import urllib.request
 from typing import Any
 
 from wikidata_websites import normalize_site_url
+from request_budget import consume_request
 
 ENDPOINT = "https://api.search.tinyfish.ai"
 API_HOST = "api.search.tinyfish.ai"
@@ -26,6 +27,17 @@ DIRECTORY_HOSTS = {
     "tracxn.com", "unrealfund.com", "21st.ai", "byndle.no", "utdanning.no",
     "yelp.com", "finansavisen.no", "eiendomssjekk.no", "rorleggerplassen.no",
     "forvalt.no", "1850.no", "bestillerorlegger.no",
+    # Business-information and membership directories. Exact company details
+    # on these sites establish which record the page describes, not ownership
+    # of the site by that company.
+    "firmalisten.no", "aksjegrafen.com", "bestebedrift.no", "norgelei.no",
+    "prishelten.no", "falio.no", "rosa.no", "medbyggerne.no",
+    # Marketplaces and classifieds are possible external evidence, never the
+    # legal company's own web-presence homepage.
+    "kaspi.kz", "amazon.com", "ebay.com", "etsy.com", "finn.no",
+    "alibaba.com", "aliexpress.com", "walmart.com", "facebook.com",
+    "instagram.com", "linkedin.com", "x.com", "twitter.com",
+    "youtube.com", "tiktok.com", "myshopify.com",
 }
 
 
@@ -40,6 +52,11 @@ class _FixedHostRedirect(urllib.request.HTTPRedirectHandler):
 def _is_directory(host: str) -> bool:
     host = host.lower().rstrip(".")
     return any(host == blocked or host.endswith("." + blocked) for blocked in DIRECTORY_HOSTS)
+
+
+def is_directory_host(host: str) -> bool:
+    """Return whether a host is a known directory rather than a company site."""
+    return _is_directory(host)
 
 
 def _domain_matches_name(url: str, legal_name: str) -> bool:
@@ -113,6 +130,7 @@ class TinyFishWebsiteDiscovery:
         )
         self.requests += 1
         try:
+            consume_request("TinyFish Search")
             with urllib.request.build_opener(_FixedHostRedirect()).open(request, timeout=self.timeout) as response:
                 if urllib.parse.urlsplit(response.geturl()).hostname != API_HOST:
                     raise ValueError("TinyFish Search response came from an unexpected host")
@@ -132,9 +150,12 @@ class TinyFishWebsiteDiscovery:
         if self.requests >= self.max_requests:
             return {"status": "budget_exhausted", "candidate_urls": [], "requests": 0,
                     "estimated_cost_usd": 0.0, "reason": "TinyFish request budget is exhausted"}
-        candidates = [url for url in self._search(f'"{org}"') if _domain_matches_name(url, legal_name)]
+        candidates = self._search(f'"{org}"')
         if not candidates and len(self.errors) == starting_errors and legal_name.strip() and self.requests < self.max_requests:
-            candidates = [url for url in self._search(f'"{legal_name.strip()}"') if _domain_matches_name(url, legal_name)]
+            candidates = self._search(f'"{legal_name.strip()}"')
+        # Domain/name resemblance is ranking evidence only. It must not discard
+        # a trading-name or group-brand site that could prove the exact org no.
+        candidates.sort(key=lambda url: (not _domain_matches_name(url, legal_name), url))
         status = "candidate_found" if candidates else "failed" if len(self.errors) > starting_errors else "not_found"
         return {
             "status": status,

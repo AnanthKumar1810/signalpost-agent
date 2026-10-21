@@ -3,7 +3,7 @@ import json
 import unittest
 from unittest.mock import patch
 
-from nav_jobs import NavJobFeed, _NavRedirect, _name_key
+from nav_jobs import NavJobFeed, _NavRedirect, _name_is_candidate, _name_key
 
 
 def profile(org="923609016", name="Example AS", municipality="Oslo", website="https://example.no"):
@@ -17,9 +17,9 @@ def profile(org="923609016", name="Example AS", municipality="Oslo", website="ht
 
 
 class NavJobFeedTests(unittest.TestCase):
-    def fake_run(self, detail):
+    def fake_run(self, detail, business_name="Example AS"):
         page = {"items": [{"id": "ad-1", "url": "/api/v1/feedentry/ad-1", "_feed_entry": {
-            "uuid": "ad-1", "status": "ACTIVE", "businessName": "Example AS", "title": "Engineer"}}], "next_url": None}
+            "uuid": "ad-1", "status": "ACTIVE", "businessName": business_name, "title": "Engineer"}}], "next_url": None}
         responses = [(b"token\nheader\neyJhbGci.eyJzdWIi.signature", None), (json.dumps(page).encode(), page), (json.dumps(detail).encode(), detail)]
         def get(_self, url, token=None, modified_since=None):
             _self.requests += 1
@@ -28,6 +28,18 @@ class NavJobFeedTests(unittest.TestCase):
 
     def test_normalizes_norwegian_name_and_company_suffix(self):
         self.assertEqual(_name_key("Ålesund Company ASA"), "alesund company")
+
+    def test_similar_feed_name_is_only_a_candidate_and_exact_org_detail_decides(self):
+        self.assertTrue(_name_is_candidate("Example Group", "example"))
+        self.assertFalse(_name_is_candidate("Unrelated Group", "example"))
+        expiry = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=4)).isoformat()
+        detail = {"status": "ACTIVE", "ad_content": {"title": "Engineer", "expires": expiry,
+            "employer": {"name": "Example Group", "orgnr": "923609016"},
+            "workLocations": [{"municipal": "Bergen"}]}}
+        row = profile()
+        with patch.object(NavJobFeed, "_get", self.fake_run(detail, "Example Group")):
+            report = NavJobFeed().enrich([row])
+        self.assertEqual(report["matched_profiles"], 1)
 
     def test_accepts_active_exact_org_job_with_expiry(self):
         expiry = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=4)).isoformat()
@@ -44,6 +56,9 @@ class NavJobFeedTests(unittest.TestCase):
         self.assertEqual(job["facts"][0]["value"]["title"], "Engineer")
         self.assertEqual(job["facts"][0]["_nav_url"], "https://pam-stilling-feed.nav.no/api/v1/feedentry/ad-1")
         self.assertEqual(report["lookback_days"], 180)
+        self.assertEqual(report["candidate_details_queued"], 1)
+        self.assertEqual(report["details_fetched"], 1)
+        self.assertEqual(report["entity_mismatches"], 0)
 
     def test_rejects_stale_ad_even_when_feed_header_says_active(self):
         detail = {"status": "INACTIVE", "ad_content": {"title": "Engineer"}}

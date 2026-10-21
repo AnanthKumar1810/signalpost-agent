@@ -17,6 +17,7 @@ import urllib.request
 from typing import Any
 
 from wikidata_websites import normalize_site_url
+from request_budget import consume_request
 
 ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 API_HOST = "api.search.brave.com"
@@ -96,6 +97,7 @@ class BraveWebsiteDiscovery:
         self.requests += 1
         opener = urllib.request.build_opener(_SameHostRedirect())
         try:
+            consume_request("Brave Search")
             with opener.open(request, timeout=self.timeout) as response:
                 if urllib.parse.urlsplit(response.geturl()).hostname != API_HOST:
                     raise ValueError("Brave Search response came from an unexpected host")

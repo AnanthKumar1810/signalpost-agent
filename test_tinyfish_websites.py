@@ -40,6 +40,10 @@ class TinyFishDiscoveryTests(unittest.TestCase):
             {"url": "https://virksomhet.brreg.no/nb/oppslag/enheter/923609016"},
             {"url": "https://forvalt.no/Nettbutikk/produkter/923609016"},
             {"url": "https://www.1850.no/bedrifter/example"},
+            {"url": "https://firmalisten.no/923609016"},
+            {"url": "https://aksjegrafen.com/selskap/923609016"},
+            {"url": "https://rosa.no/tlf/example/923609016"},
+            {"url": "https://kaspi.kz/shop/p/923609016"},
             {"url": "https://linkedin.com/company/example"},
             {"url": "https://127.0.0.1/admin"},
             {"url": "https://example.no/"},
@@ -56,7 +60,7 @@ class TinyFishDiscoveryTests(unittest.TestCase):
         self.assertEqual(result["status"], "not_found")
         self.assertEqual(result["requests"], 1)
 
-    def test_generic_org_result_is_rejected_before_legal_name_fallback(self):
+    def test_domain_mismatch_is_retained_as_a_candidate_for_identity_verification(self):
         opener = unittest.mock.Mock()
         opener.open.side_effect = [
             FakeResponse({"results": [{"url": "https://generic-news.example/company/923609016"}]}),
@@ -64,8 +68,8 @@ class TinyFishDiscoveryTests(unittest.TestCase):
         ]
         with patch("tinyfish_websites.urllib.request.build_opener", return_value=opener):
             result = TinyFishWebsiteDiscovery(api_key="test").discover("923609016", "Example AS")
-        self.assertEqual(result["candidate_urls"], ["https://www.example.no/"])
-        self.assertEqual(result["requests"], 2)
+        self.assertEqual(result["candidate_urls"], ["https://generic-news.example/company/923609016"])
+        self.assertEqual(result["requests"], 1)
 
 
 if __name__ == "__main__":

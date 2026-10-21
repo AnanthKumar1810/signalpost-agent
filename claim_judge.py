@@ -16,6 +16,7 @@ import urllib.parse
 import urllib.request
 from datetime import date, datetime, timezone
 from typing import Any
+from request_budget import consume_request
 from urllib.robotparser import RobotFileParser
 
 API = "https://api.openai.com/v1/responses"
@@ -59,6 +60,7 @@ class WebSearchJudge:
         req = urllib.request.Request(API, data=body, headers={"Authorization": f"Bearer {self.api_key}",
                             "Content-Type": "application/json"}, method="POST")
         try:
+            consume_request("OpenAI search judge")
             with urllib.request.urlopen(req, timeout=self.timeout) as res:
                 raw = res.read(1_000_001)
                 if len(raw) > 1_000_000:

@@ -1,5 +1,6 @@
 import json
 import io
+import sqlite3
 import tempfile
 import unittest
 import urllib.error
@@ -53,6 +54,14 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(result["identity_anchor"]["status"], "failed")
         self.assertIn("could not be verified", result["summary"]["text"])
         self.assertEqual(result["summary"]["evidence_ids"], [])
+
+    def test_finish_does_not_replace_an_accepted_llm_summary(self):
+        env = {"organisation_number": "923609016", "identity_anchor": {"status": "verified", "legal_name": "Example AS"},
+               "claims": [], "evidence": [], "source_snapshots": [], "changes": [], "errors": [],
+               "operations": {"requests": 0, "runtime_ms": 0}, "run": {},
+               "summary": {"text": "Accepted LLM prose.", "method": "optional LLM summary; generated from verified fact catalog"}}
+        result = self.agent.finish(env, 0.0)
+        self.assertEqual(result["summary"]["text"], "Accepted LLM prose.")
 
     def test_common_display_spacing_and_hyphens_are_normalized(self):
         self.assertTrue(sp.valid_org("923 609 016"))
@@ -264,7 +273,7 @@ class AgentTests(unittest.TestCase):
         self.assertEqual({item["family"] for item in claims}, {"web_presence", "jobs", "public_activity"})
         self.assertTrue(all(item["status"] == "not_available" for item in claims))
 
-    def test_repeat_same_snapshot_is_idempotent(self):
+    def test_repeat_snapshot_is_idempotent_and_tracks_source_revisions_independently(self):
         data = {"navn": "Eksempel AS"}
         raw = json.dumps(data).encode()
         one = self.agent.snapshot("923609016", "registry", "https://data.brreg.no/x", raw, data)
@@ -274,10 +283,37 @@ class AgentTests(unittest.TestCase):
         self.assertFalse(one["changed"])
         self.assertFalse(two["changed"])
         self.assertEqual(count, 1)
+        first = self.agent.snapshot("923609016", "jobs", "https://jobs.example/one", b"one", {"title": "Engineer"})
+        second = self.agent.snapshot("923609016", "jobs", "https://jobs.example/two", b"two", {"title": "Designer"})
+        self.assertFalse(first["changed"])
+        self.assertFalse(second["changed"])
+        revision = self.agent.snapshot("923609016", "jobs", "https://jobs.example/one", b"one-new", {"title": "Senior Engineer"})
+        self.assertTrue(revision["changed"])
+        self.assertEqual(revision["changed_fields"], ["title"])
+        stored = self.agent.db.execute("select source_url,payload from snapshots where source_key like 'https://jobs.example/one%'").fetchall()
+        self.assertTrue(all(row[0] == "https://jobs.example/one" for row in stored))
+        self.assertTrue(any("Senior Engineer" in row[1] for row in stored))
         changed = self.agent.snapshot("923609016", "registry", "https://data.brreg.no/x", b'{"navn":"Nytt AS"}', {"navn":"Nytt AS"})
         self.assertTrue(changed["changed"])
         self.assertEqual(changed["changed_fields"], ["navn"])
 
+    def test_old_snapshot_database_is_migrated_without_dropping_history(self):
+        path = Path(self.tmp.name) / "legacy.sqlite3"
+        db = sqlite3.connect(path)
+        db.execute("create table snapshots(org text, family text, digest text, fetched_at text, payload text, primary key(org,family,digest))")
+        db.execute("insert into snapshots values('923609016','registry','oldhash','2026-01-01T00:00:00Z','{}')")
+        db.execute("create table current_sources(org text, family text, digest text, fetched_at text, payload text, primary key(org,family))")
+        db.execute("insert into current_sources values('923609016','registry','oldhash','2026-01-01T00:00:00Z','{}')")
+        db.commit()
+        db.close()
+        migrated = sp.Agent(path, website=False)
+        try:
+            self.assertEqual(migrated.db.execute("select count(*) from snapshots where source_key='legacy'").fetchone()[0], 1)
+            self.assertEqual(migrated.db.execute("select count(*) from current_sources where source_key='legacy'").fetchone()[0], 1)
+            migrated.snapshot("923609016", "registry", "https://data.brreg.no/enheter/923609016", b"new", {"name": "Example AS"})
+            self.assertEqual(migrated.db.execute("select count(*) from snapshots").fetchone()[0], 2)
+        finally:
+            migrated.db.close()
     def test_nameless_or_mismatched_site_is_ambiguous(self):
         class Headers:
             def get_content_type(self): return "text/html"
@@ -294,22 +330,24 @@ class AgentTests(unittest.TestCase):
         web_claim = next(c for c in claims if c[0][0] == "web_presence")
         self.assertEqual(web_claim[0][1], "ambiguous")
 
-    def test_registered_name_in_body_can_verify_but_short_negative_mention_cannot(self):
-        self.assertTrue(sp.legal_name_matches_page(
+    def test_suffix_free_brand_is_not_identity_but_full_legal_name_is(self):
+        self.assertFalse(sp.legal_name_matches_page(
             "NORDIC COFFEE ROASTERS AS",
             "Welcome. Company details: Nordic Coffee Roasters. Org information and contact details.",
         ))
+        self.assertTrue(sp.legal_name_matches_page(
+            "NORDIC COFFEE ROASTERS AS", "Legal entity: Nordic Coffee Roasters AS."))
         self.assertFalse(sp.legal_name_matches_page(
             "Example AS", "Another legal entity. This is not Example AS.", "Another legal entity",
         ))
         self.assertFalse(sp.legal_name_matches_page(
             "NORDIC COFFEE ROASTERS AS", "Nordic Coffee Academic Partnership", "Nordic Coffee Academic Partnership",
         ))
-        self.assertTrue(sp.legal_name_matches_page("DIPS AS", "DIPS", "DIPS"))
-        self.assertTrue(sp.legal_name_matches_page("DIPS AS", "About DIPS and how DIPS supports hospitals."))
+        self.assertFalse(sp.legal_name_matches_page("DIPS AS", "DIPS", "DIPS"))
+        self.assertFalse(sp.legal_name_matches_page("DIPS AS", "About DIPS and how DIPS supports hospitals."))
         self.assertFalse(sp.legal_name_matches_page("DIPS AS", "We work with DIPS."))
 
-    def test_website_collector_accepts_suffix_free_name_in_page_body(self):
+    def test_website_collector_accepts_exact_org_number_when_brand_name_differs(self):
         class Headers:
             def get_content_type(self): return "text/html"
         class Response:
@@ -322,7 +360,7 @@ class AgentTests(unittest.TestCase):
         robots = Response("https://example.no/robots.txt", b"User-agent: *\\nAllow: /\\n")
         homepage = Response(
             "https://example.no/",
-            b"<title>Nordic Roast</title><p>Company details: Nordic Coffee Roasters.</p>",
+            b"<title>Nordic Roast</title><p>Org.nr: 923 609 016</p><p>Nordic Coffee Roasters.</p>",
         )
         env = {"operations": {"requests": 0}, "source_snapshots": [], "evidence": [], "errors": [], "changes": []}
         claims = []
@@ -334,10 +372,36 @@ class AgentTests(unittest.TestCase):
         self.assertEqual({fact["field"] for fact in web["facts"]}, {"website_url", "website_title"})
         self.assertEqual(env["operations"]["requests"], 2)
 
+    def test_identity_in_bounded_legal_page_can_verify_brand_homepage(self):
+        class Headers:
+            def get_content_type(self): return "text/html"
+        class Response:
+            headers = Headers()
+            def __init__(self, url, body): self.url, self.body = url, body
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def geturl(self): return self.url
+            def read(self, _limit): return self.body
+        responses = [
+            Response("https://example.no/robots.txt", b"User-agent: *\nAllow: /\n"),
+            Response("https://example.no/", b'<title>Nordic Roast</title><a href="/legal">Legal information</a>'),
+            Response("https://example.no/legal", b"<h1>Legal entity</h1><p>Org.nr 923 609 016</p>"),
+        ]
+        env = {"operations": {"requests": 0}, "source_snapshots": [], "evidence": [], "errors": [], "changes": []}
+        claims = []
+        with patch.object(sp, "public_host", return_value=True), patch.object(sp, "open_safe", side_effect=responses):
+            self.agent.website("923609016", "https://example.no", "NORDIC COFFEE ROASTERS AS", env,
+                               lambda *a, **k: claims.append(a))
+        website = next(item for item in claims if item[0] == "web_presence")
+        self.assertEqual(website[1], "available")
+        self.assertEqual(len(website[2][0]["evidence_ids"]), 2)
+        self.assertEqual(env["operations"]["requests"], 3)
+
     def test_formatted_org_number_is_recognized_exactly(self):
         self.assertTrue(sp.page_has_organisation_number("Org.nr. 923 609 016", "923609016"))
         self.assertTrue(sp.page_has_organisation_number("Org.nr: 923-609-016", "923609016"))
         self.assertFalse(sp.page_has_organisation_number("Org.nr. 923 609 017", "923609016"))
+        self.assertFalse(sp.page_has_organisation_number("Product 30342669_923609016", "923609016"))
 
     def test_open_web_candidate_domain_must_match_distinctive_name(self):
         self.assertTrue(sp.domain_matches_legal_name("vvscompaniet.no", "VVS COMPANIET AS"))
@@ -351,11 +415,60 @@ class AgentTests(unittest.TestCase):
         self.assertFalse(sp.public_host("10.0.0.8"))
         self.assertTrue(sp.public_host("8.8.8.8"))
 
+    def test_third_party_directory_is_not_published_as_company_website(self):
+        env = {"operations": {"requests": 0}, "claims": [], "errors": [],
+               "evidence": [], "source_snapshots": [], "changes": []}
+        claims = []
+        self.agent.website("919951486", "https://firmalisten.no/919951486",
+                           "ARV INVEST AS", env,
+                           lambda *args, **kwargs: claims.append((args, kwargs)))
+        website = next(call for call in claims if call[0][0] == "web_presence")
+        self.assertEqual(website[0][1], "ambiguous")
+        self.assertIn("third-party business directory", website[1]["reason"])
+        self.assertEqual(env["operations"]["requests"], 0)
+
+    def test_search_candidate_needs_same_host_legal_corroboration(self):
+        class Headers:
+            def __init__(self, content_type): self.content_type = content_type
+            def get_content_type(self): return self.content_type
+        class Response:
+            def __init__(self, body, url, content_type): self.body,self.url,self.headers=body,url,Headers(content_type)
+            def __enter__(self): return self
+            def __exit__(self, *_args): return False
+            def geturl(self): return self.url
+            def read(self, size): return self.body
+        responses = [
+            Response(b"User-agent: *\\nAllow: /\\n", "https://market.example/robots.txt", "text/plain"),
+            Response(b"<title>Example AS</title><h1>Example AS</h1><p>Product 30342669_923609016</p>",
+                     "https://market.example/", "text/html"),
+        ]
+        env = {"operations": {"requests": 0}, "claims": [], "errors": [],
+               "evidence": [], "source_snapshots": [], "changes": []}
+        claims = []
+        with patch.object(sp, "public_host", return_value=True), patch.object(sp, "open_safe", side_effect=responses):
+            self.agent.website("923609016", "https://market.example/", "Example AS", env,
+                               lambda *args, **kwargs: claims.append((args, kwargs)),
+                               require_domain_name_match=True)
+        website = next(call for call in claims if call[0][0] == "web_presence")
+        self.assertEqual(website[0][1], "ambiguous")
+        self.assertIn("same-host legal/contact evidence", website[1]["reason"])
+
     def test_safe_website_requires_exact_legal_name_or_org_number(self):
         parser = sp.PageParser("https://example.no/")
         parser.feed("<title>Company</title><body>Example AS offers software.</body>")
         self.assertTrue(bool(__import__("re").search(r"(?<![\w])" + __import__("re").escape("Example AS") + r"(?![\w])", "Example AS offers software.", __import__("re").I)))
         self.assertFalse(bool(__import__("re").search(r"(?<![\w])" + __import__("re").escape("Example AS") + r"(?![\w])", "Example ASSETS", __import__("re").I)))
+
+    def test_jsonld_job_entity_requires_exact_org_or_registered_name(self):
+        parser = sp.PageParser("https://example.no/job")
+        parser.feed('''<script type="application/ld+json">{"@type":"JobPosting","title":"Engineer",
+        "hiringOrganization":{"@type":"Organization","name":"Trading Brand","identifier":"923 609 016"}}</script>
+        <script type="application/ld+json">{"@type":"JobPosting","title":"Other",
+        "hiringOrganization":{"@type":"Organization","name":"Wrong AS","identifier":"987654321"}}</script>''')
+        postings = [item for item in sp._jsonld_objects(parser) if "jobposting" in sp._jsonld_types(item)]
+        self.assertEqual(len(postings), 2)
+        self.assertTrue(sp._jsonld_exact_entity(postings[0], "923609016", "Example AS"))
+        self.assertFalse(sp._jsonld_exact_entity(postings[1], "923609016", "Example AS"))
 
 
 class RolePayloadCompatibilityTests(unittest.TestCase):
@@ -423,6 +536,58 @@ class PublicActivityTests(unittest.TestCase):
         self.assertEqual(activity[1], "available")
         self.assertEqual(activity[2][0]["value"]["published_at"], "2026-10-15")
         self.assertEqual(len(activity[2][0]["evidence_ids"]), 1)
+
+    def test_jsonld_article_needs_matching_publisher_and_uses_structured_date(self):
+        class Headers:
+            def get_content_type(self): return "text/html"
+        class Response:
+            headers = Headers()
+            def __init__(self, url, body): self.url, self.body = url, body
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def geturl(self): return self.url
+            def read(self, _limit): return self.body
+        html = b'''<title>Example AS</title><h1>Example AS</h1>
+        <script type="application/ld+json">{"@type":"NewsArticle","headline":"New office opened",
+        "datePublished":"2026-10-16T09:00:00Z","publisher":{"@type":"Organization","name":"Example AS","identifier":"923609016"}}</script>'''
+        responses = [Response("https://example.no/robots.txt", b"User-agent: *\nAllow: /"),
+                     Response("https://example.no/", html)]
+        env = {"operations": {"requests": 0}, "source_snapshots": [], "evidence": [], "errors": [], "changes": []}
+        claims = []
+        with patch.object(sp, "public_host", return_value=True), patch.object(sp, "open_safe", side_effect=responses):
+            self.agent.website("923609016", "https://example.no", "Example AS", env,
+                               lambda *a, **k: claims.append(a))
+        activity = next(call for call in claims if call[0] == "public_activity")
+        self.assertEqual(activity[1], "available")
+        self.assertEqual(activity[2][0]["value"], {"title": "New office opened", "published_at": "2026-10-16"})
+
+    def test_activity_listing_follows_one_verified_article_detail(self):
+        class Headers:
+            def get_content_type(self): return "text/html"
+        class Response:
+            headers = Headers()
+            def __init__(self, url, body): self.url, self.body = url, body
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def geturl(self): return self.url
+            def read(self, _limit): return self.body
+        root = b'<title>Example AS</title><h1>Example AS</h1><a href="/news">News</a>'
+        listing = b'<title>News</title><a href="/news/update">Read update</a>'
+        article = b'''<title>Update</title><script type="application/ld+json">{"@type":"NewsArticle",
+        "headline":"New office opened","datePublished":"2026-10-16T09:00:00Z",
+        "publisher":{"@type":"Organization","name":"Example AS","identifier":"923609016"}}</script>'''
+        responses = [Response("https://example.no/robots.txt", b"User-agent: *\nAllow: /"),
+                     Response("https://example.no/", root), Response("https://example.no/news", listing),
+                     Response("https://example.no/news/update", article)]
+        env = {"operations": {"requests": 0}, "source_snapshots": [], "evidence": [], "errors": [], "changes": []}
+        claims = []
+        with patch.object(sp, "public_host", return_value=True), patch.object(sp, "open_safe", side_effect=responses):
+            self.agent.website("923609016", "https://example.no", "Example AS", env,
+                               lambda *a, **k: claims.append(a))
+        activity = next(call for call in claims if call[0] == "public_activity")
+        self.assertEqual(activity[1], "available")
+        self.assertEqual(activity[2][0]["value"]["title"], "New office opened")
+        self.assertEqual(env["operations"]["requests"], 4)
 
 
 if __name__ == "__main__":

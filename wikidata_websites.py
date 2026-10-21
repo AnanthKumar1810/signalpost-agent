@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any
+from request_budget import consume_request
 
 
 ENDPOINT = "https://query.wikidata.org/sparql"
@@ -64,11 +66,11 @@ class WikidataWebsiteDiscovery:
         self.failed_organisations: set[str] = set()
 
     @staticmethod
-    def _has_registry_website(profile: dict[str, Any]) -> bool:
-        for claim in profile.get("claims", []):
-            if claim.get("family") == "company_details":
-                return any(f.get("field") == "website" and f.get("value") for f in claim.get("facts", []))
-        return False
+    def _has_verified_website(profile: dict[str, Any]) -> bool:
+        return any(claim.get("family") == "web_presence" and claim.get("status") == "available"
+                   and any(fact.get("field") == "website_url" and fact.get("value")
+                           for fact in claim.get("facts", []))
+                   for claim in profile.get("claims", []) if isinstance(claim, dict))
 
     def _query(self, orgs: list[str]) -> tuple[bytes, list[dict[str, str]]]:
         values = " ".join('"' + org + '"' for org in orgs)
@@ -82,6 +84,7 @@ class WikidataWebsiteDiscovery:
             headers={"Accept": "application/sparql-results+json", "User-Agent": UA},
         )
         opener = urllib.request.build_opener(_SameHostRedirect())
+        consume_request("Wikidata SPARQL")
         with opener.open(request, timeout=self.timeout) as response:
             if response.geturl().split("/", 3)[:3] != ["https:", "", "query.wikidata.org"]:
                 raise ValueError("Wikidata returned a response from an unexpected host")
@@ -105,18 +108,22 @@ class WikidataWebsiteDiscovery:
                 rows.append({"organisation_number": org, "item": item, "qid": qid, "site": site})
         return body, rows
 
-    def discover(self, profiles: list[dict[str, Any]]) -> tuple[dict[str, dict[str, str]], dict[str, Any]]:
+    def discover(self, profiles: list[dict[str, Any]], deadline: float | None = None) -> tuple[dict[str, dict[str, str]], dict[str, Any]]:
         targets = {
             str(row.get("organisation_number")): row
             for row in profiles
             if (row.get("identity_anchor") or {}).get("status") == "verified"
-            and not self._has_registry_website(row)
+            and not self._has_verified_website(row)
         }
         candidates: dict[str, dict[str, str]] = {}
         if not targets:
             return candidates, {"status": "no_targets", "requests": 0, "target_count": 0, "candidate_count": 0, "errors": []}
         orgs = sorted(org for org in targets if re.fullmatch(r"[0-9]{9}", org))
+        deadline_reached = False
         for offset in range(0, len(orgs), self.batch_size):
+            if deadline is not None and time.monotonic() >= deadline:
+                deadline_reached = True
+                break
             batch = orgs[offset:offset + self.batch_size]
             self.requests += 1
             try:
@@ -130,13 +137,14 @@ class WikidataWebsiteDiscovery:
                 current = candidates.get(row["organisation_number"])
                 if current is None or (row["site"].lower(), row["item"]) < (current["site"].lower(), current["item"]):
                     candidates[row["organisation_number"]] = row
-        status = "complete" if not self.errors else "partial" if candidates else "failed"
+        status = "partial" if deadline_reached else "complete" if not self.errors else "partial" if candidates else "failed"
         return candidates, {
             "status": status,
             "requests": self.requests,
             "target_count": len(orgs),
             "candidate_count": len(candidates),
             "failed_organisations": sorted(self.failed_organisations),
+            "deadline_reached": deadline_reached,
             "errors": self.errors,
             "identity_rule": "Wikidata P2333 exactly equals requested organisation number; P856 is only a candidate, and fetched page still needs independent identity verification.",
             "license": "Wikidata structured data (CC0)",

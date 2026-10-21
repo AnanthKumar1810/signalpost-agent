@@ -1,4 +1,6 @@
 import json
+import urllib.error
+from email.message import Message
 import unittest
 from unittest.mock import patch
 
@@ -53,6 +55,20 @@ class LLMSummaryTests(unittest.TestCase):
         self.assertEqual(result["calls_made"], 0)
         self.assertEqual(result["status"], "skipped_unverified_identity")
 
+    def test_http_429_opens_circuit_and_preserves_retry_after(self):
+        headers = Message()
+        headers["Retry-After"] = "45"
+        rate_limit = urllib.error.HTTPError("https://api.openai.com/v1/responses", 429, "rate limited", headers, None)
+        agent = LLMSummaryAgent(api_key="test")
+        with patch("llm_summary.urllib.request.urlopen", side_effect=rate_limit) as urlopen:
+            first = agent.summarize(profile())
+            second = agent.summarize(profile())
+        self.assertEqual(first["http_status"], 429)
+        self.assertEqual(first["retry_after"], "45")
+        self.assertEqual(second["status"], "circuit_open")
+        self.assertEqual(second["calls_made"], 0)
+        self.assertEqual(urlopen.call_count, 1)
+
     def test_prompt_contains_only_collected_claim_fields_and_no_source_content(self):
         row = profile()
         catalog, _ = _catalog(row)
@@ -81,6 +97,8 @@ class LLMSummaryTests(unittest.TestCase):
         summary, error = LLMSummaryAgent._validate(text, catalog, refs, missing)
         self.assertIsNone(error)
         self.assertEqual(len(summary["claim_map"]), 3)
+        self.assertEqual(summary["claim_map"][0]["field_refs"], ["company_details.city#3", "company_details.legal_name#1"])
+        self.assertEqual(summary["claim_map"][2]["field_refs"], ["financials.revenue_nok#1"])
         self.assertEqual(set(summary["evidence_ids"]), {"registry:one", "financials:one"})
         self.assertTrue(summary["text"].endswith(missing))
 
@@ -91,6 +109,7 @@ class LLMSummaryTests(unittest.TestCase):
         invalids = [
             ("{\"summary\": \"bad\"}", "summary_not_plain_prose"),
             ("Example AS is registered in Oslo. Revenue was NOK 750,000 in 2025. There are 12 staff. " + missing, "unsupported_numeric_value"),
+            ("Example AS is registered in Oslo. Revenue was NOK 750,000 in 2025. It is a fast-growing market leader. " + missing, "unsupported_factual_sentence"),
             ("Example AS is in Oslo. Revenue was NOK 750,000 in 2025. Software development is listed.", "missing_categories_sentence_must_be_last"),
             ("- Example AS is in Oslo.\n- Revenue is NOK 750,000 in 2025.\n- Software development is listed.\n" + missing, "summary_not_plain_prose"),
         ]

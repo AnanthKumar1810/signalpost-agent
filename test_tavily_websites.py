@@ -24,7 +24,7 @@ class TavilyDiscoveryTests(unittest.TestCase):
     def test_searches_org_then_name_and_discards_search_text(self):
         opener = unittest.mock.Mock()
         opener.open.side_effect = [
-            FakeResponse({"query": '"923609016"', "results": [{"url": "https://directory.example/company"}], "usage": {"credits": 1}}),
+            FakeResponse({"query": '"923609016"', "results": [{"url": "https://proff.no/company/923609016"}], "usage": {"credits": 1}}),
             FakeResponse({"query": '"Nordic Coffee AS"', "results": [
                 {"url": "https://nordiccoffee.no/about?utm_source=tavily", "title": "private title", "content": "private snippet"},
                 {"url": "https://linkedin.com/company/nordiccoffee", "title": "private title"},
@@ -42,7 +42,7 @@ class TavilyDiscoveryTests(unittest.TestCase):
         self.assertEqual(result["requests"], 2)
         self.assertEqual(result["credits_used"], 2)
 
-    def test_rejects_directory_private_ip_and_unrelated_domain(self):
+    def test_rejects_directory_and_private_ip_but_keeps_domain_mismatch_as_candidate(self):
         payload = {"results": [
             {"url": "https://proff.no/company/nordic"},
             {"url": "https://127.0.0.1/admin"},
@@ -50,8 +50,7 @@ class TavilyDiscoveryTests(unittest.TestCase):
             {"url": "https://nordiccoffee.no/"},
         ]}
         urls, credits = TavilyWebsiteDiscovery._parse_candidates(json.dumps(payload).encode(), 5)
-        urls = [url for url in urls if _domain_matches_name(url, "Nordic Coffee AS")]
-        self.assertEqual(urls, ["https://nordiccoffee.no/"])
+        self.assertEqual(urls, ["https://academic.example/", "https://nordiccoffee.no/"])
         self.assertEqual(credits, 0)
 
     def test_request_budget_and_network_failure_are_explicit(self):

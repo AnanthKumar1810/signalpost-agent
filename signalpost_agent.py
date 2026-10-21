@@ -20,7 +20,7 @@ import time
 import unicodedata
 import uuid
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -33,9 +33,10 @@ from nav_jobs import NavJobFeed
 from public_ats import fetch_linked_jobs
 from wikidata_websites import WikidataWebsiteDiscovery
 from brave_websites import BraveWebsiteDiscovery
-from tinyfish_websites import TinyFishWebsiteDiscovery
+from tinyfish_websites import TinyFishWebsiteDiscovery, is_directory_host
 from tavily_websites import TavilyWebsiteDiscovery
 from llm_summary import LLMSummaryAgent
+from request_budget import activate as activate_request_budget, deactivate as deactivate_request_budget, consume_request, stats as request_budget_stats
 
 BRREG = "https://data.brreg.no/enhetsregisteret/api"
 # Query BRREG production. The PPE host is pre-production and has no service guarantee.
@@ -80,6 +81,14 @@ def _verify_discovered_website_candidates(agent: Any, original: dict[str, Any], 
     return original, attempted_requests, False, ambiguous, blocked
 
 
+def has_verified_website(profile: dict[str, Any]) -> bool:
+    """Only a published, evidence-gated website claim closes discovery."""
+    return any(claim.get("family") == "web_presence" and claim.get("status") == "available"
+               and any(fact.get("field") == "website_url" and fact.get("value")
+                       for fact in claim.get("facts", []))
+               for claim in profile.get("claims", []) if isinstance(claim, dict))
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
@@ -109,21 +118,16 @@ def _normalized_name_tokens(value: str) -> list[str]:
 
 
 def legal_name_matches_page(legal_name: str, page_text: str, identity_heading: str = "") -> bool:
-    """Match the full registered name in page text, optionally without legal form.
-
-    This is used only on a BRREG-listed or identifier-discovered domain. The
-    suffix-stripped form requires at least two distinctive tokens; short names
-    still need the exact organisation number to avoid weak matches.
-    """
+    """Match the registered legal name; a brand or suffix-free name is not enough."""
     name_tokens = _normalized_name_tokens(legal_name)
     page_tokens = _normalized_name_tokens(page_text)
     if not name_tokens or not page_tokens:
         return False
     heading_tokens = _normalized_name_tokens(identity_heading)
-    if len(name_tokens) == 1 and len(name_tokens[0]) >= 4:
-        if any(heading_tokens[index:index + 1] == name_tokens for index in range(len(heading_tokens))):
-            return True
-    elif len(name_tokens) >= 2 and any(
+    # A one-word brand (for example "DIPS") is not legal-entity evidence by
+    # itself. It must appear with the registered legal form or be corroborated
+    # by the exact organisation number checked separately by the caller.
+    if len(name_tokens) >= 2 and any(
         heading_tokens[index:index + len(name_tokens)] == name_tokens
         for index in range(max(0, len(heading_tokens) - len(name_tokens) + 1))
     ):
@@ -134,20 +138,11 @@ def legal_name_matches_page(legal_name: str, page_text: str, identity_heading: s
     # substantive words. A short name must appear in the identity heading or be
     # corroborated by the exact organisation number.
     distinctive = name_tokens[:-1] if name_tokens[-1] in _LEGAL_FORM_SUFFIXES else name_tokens
-    if len(distinctive) == 1 and len(distinctive[0]) >= 4:
-        if heading_tokens == distinctive:
-            return True
-        # For short, single-word brands, require two exact whole-word mentions
-        # on the already registry-linked/identifier-discovered site.
-        occurrences = sum(1 for token in page_tokens if token == distinctive[0])
-        return occurrences >= 2
+    if len(distinctive) == 1:
+        return False
     if len(distinctive) < 2 or not all(len(token) >= 3 for token in distinctive):
         return False
     candidates = [name_tokens]
-    if name_tokens[-1] in _LEGAL_FORM_SUFFIXES:
-        stripped = name_tokens[:-1]
-        if len(stripped) >= 2 and all(len(token) >= 3 for token in stripped):
-            candidates.append(stripped)
     for candidate in candidates:
         width = len(candidate)
         if width <= len(page_tokens) and any(
@@ -159,11 +154,17 @@ def legal_name_matches_page(legal_name: str, page_text: str, identity_heading: s
 
 
 def page_has_organisation_number(page_text: str, organisation_number: str) -> bool:
-    """Recognize the exact nine-digit identifier with common display spacing."""
+    """Recognize the exact number only when the page labels it as a company ID."""
     expected = normalize_org(organisation_number)
-    for candidate in re.findall(r"(?<!\d)\d(?:[\s.\-]*\d){8}(?!\d)", page_text):
-        if re.sub(r"\D", "", candidate) == expected:
-            return True
+    label = re.compile(
+        r"(?:org\.?\s*(?:nr\.?|no\.?|number)|organisasjons(?:nummer|nr\.?)|"
+        r"organisation\s*(?:number|nr\.?|no\.?)|organization\s*(?:number|nr\.?|no\.?))"
+        r"\s*[:#-]?\s*[^\d]{0,12}$", re.I)
+    for match in re.finditer(r"(?<!\d)\d(?:[\s.\-]*\d){8}(?!\d)", page_text):
+        if re.sub(r"\D", "", match.group(0)) == expected:
+            prefix = page_text[max(0, match.start() - 80):match.start()]
+            if label.search(prefix):
+                return True
     return False
 
 
@@ -258,6 +259,46 @@ def classify_job_page(page_text: str, published_dates: list[str], reference_date
         valid = max(future or recent)
         return {"field": "active_job_title", "freshness": "confirmed", "valid_at": valid.isoformat()}
     return {"field": "advertised_job_title", "freshness": "unconfirmed", "valid_at": None}
+
+
+def _jsonld_objects(parser: Any) -> list[dict[str, Any]]:
+    """Parse bounded JSON-LD scripts into objects; malformed scripts are ignored."""
+    found: list[dict[str, Any]] = []
+    def visit(value: Any) -> None:
+        if isinstance(value, list):
+            for item in value: visit(item)
+        elif isinstance(value, dict):
+            graph = value.get("@graph")
+            if isinstance(graph, (dict, list)): visit(graph)
+            found.append(value)
+    for raw in getattr(parser, "jsonld", [])[:10]:
+        try:
+            visit(json.loads(raw))
+        except (TypeError, ValueError):
+            continue
+    return found
+
+
+def _jsonld_types(node: dict[str, Any]) -> set[str]:
+    value = node.get("@type")
+    values = value if isinstance(value, list) else [value]
+    return {str(item).rsplit("/", 1)[-1].casefold() for item in values if item}
+
+
+def _jsonld_exact_entity(node: dict[str, Any], org: str, legal_name: str) -> bool:
+    entity = node.get("hiringOrganization") or node.get("publisher") or node.get("author")
+    if isinstance(entity, list):
+        entity = entity[0] if entity else {}
+    if not isinstance(entity, dict):
+        return False
+    identifier = entity.get("identifier") or entity.get("taxID") or entity.get("vatID")
+    identifiers = identifier if isinstance(identifier, list) else [identifier]
+    for item in identifiers:
+        value = item.get("value") if isinstance(item, dict) else item
+        if value and re.sub(r"\D", "", str(value)) == org:
+            return True
+    name = entity.get("name")
+    return bool(isinstance(name, str) and legal_name_matches_page(legal_name, name))
 
 
 def is_generic_careers_title(title: str) -> bool:
@@ -396,6 +437,7 @@ def open_safe(req: urllib.request.Request, host: str, timeout: float, on_retry: 
     )
     for attempt in range(2):
         try:
+            consume_request("HTTP fetch")
             return opener.open(req, timeout=timeout)
         except urllib.error.HTTPError as exc:
             if attempt or exc.code not in {500, 502, 503, 504}:
@@ -421,6 +463,7 @@ class PageParser(HTMLParser):
         self.active_link: int | None = None
         self.jsonld: list[str] = []
         self.in_jsonld = False
+        self._jsonld_parts: list[str] = []
         self.meta_description: str | None = None
         self.published_dates: list[str] = []
         self._ignored_tags: list[str] = []
@@ -434,6 +477,8 @@ class PageParser(HTMLParser):
         if tag in {"script", "style", "noscript", "template"}:
             self._ignored_tags.append(tag)
             self.in_jsonld = tag == "script" and (a.get("type") or "").lower() == "application/ld+json"
+            if self.in_jsonld:
+                self._jsonld_parts = []
             return
         if tag == "meta" and (a.get("name") or "").strip().lower() == "description" and a.get("content") and self.meta_description is None:
             self.meta_description = html.unescape(a["content"] or "").strip()
@@ -459,7 +504,11 @@ class PageParser(HTMLParser):
         if self._ignored_tags:
             if tag == self._ignored_tags[-1]:
                 self._ignored_tags.pop()
-                if tag == "script": self.in_jsonld = False
+                if tag == "script":
+                    if self.in_jsonld and self._jsonld_parts:
+                        self.jsonld.append("".join(self._jsonld_parts)[:100_000])
+                    self.in_jsonld = False
+                    self._jsonld_parts = []
             return
         if tag == "title": self.in_title = False
         if tag == "h1": self.in_h1 = False
@@ -468,7 +517,7 @@ class PageParser(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self._ignored_tags:
             if self.in_jsonld:
-                self.jsonld.append(data)
+                self._jsonld_parts.append(data)
             return
         clean = " ".join(data.split())
         if clean:
@@ -484,8 +533,19 @@ class PageParser(HTMLParser):
 class Agent:
     def __init__(self, state_path: Path, website: bool = True, timeout: float = 12):
         self.db = sqlite3.connect(state_path)
-        self.db.execute("create table if not exists snapshots(org text, family text, digest text, fetched_at text, payload text, primary key(org,family,digest))")
-        self.db.execute("create table if not exists current_sources(org text, family text, digest text, fetched_at text, payload text, primary key(org,family))")
+        snapshot_columns = {row[1] for row in self.db.execute("pragma table_info(snapshots)")}
+        if snapshot_columns and "source_key" not in snapshot_columns:
+            self.db.execute("alter table snapshots rename to snapshots_legacy")
+        self.db.execute("create table if not exists snapshots(org text, family text, source_key text, source_url text, digest text, fetched_at text, payload text, primary key(org,family,source_key,digest))")
+        if self.db.execute("select 1 from sqlite_master where type='table' and name='snapshots_legacy'").fetchone():
+            self.db.execute("insert or ignore into snapshots select org,family,'legacy','',digest,fetched_at,payload from snapshots_legacy")
+        columns = {row[1] for row in self.db.execute("pragma table_info(current_sources)")}
+        if columns and "source_key" not in columns:
+            # Preserve old state as a legacy source while moving to source-level refresh keys.
+            self.db.execute("alter table current_sources rename to current_sources_legacy")
+        self.db.execute("create table if not exists current_sources(org text, family text, source_key text, digest text, fetched_at text, payload text, primary key(org,family,source_key))")
+        if self.db.execute("select 1 from sqlite_master where type='table' and name='current_sources_legacy'").fetchone():
+            self.db.execute("insert or ignore into current_sources select org,family,'legacy',digest,fetched_at,payload from current_sources_legacy")
         self.db.commit()
         self.website_enabled, self.timeout = website, timeout
 
@@ -493,7 +553,10 @@ class Agent:
         digest = hashlib.sha256(raw).hexdigest()
         fetched = now()
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-        prior = self.db.execute("select digest,payload from current_sources where org=? and family=?", (org,family)).fetchone()
+        parsed = urllib.parse.urlsplit(source_url)
+        source_key = urllib.parse.urlunsplit((parsed.scheme.lower(), (parsed.netloc or "").lower(), parsed.path or "/", parsed.query, ""))
+        source_key_hash = hashlib.sha256(source_key.encode("utf-8")).hexdigest()[:12]
+        prior = self.db.execute("select digest,payload from current_sources where org=? and family=? and source_key=?", (org,family,source_key)).fetchone()
         changed = False
         changed_fields: list[str] = []
         if prior:
@@ -507,10 +570,10 @@ class Agent:
             except Exception:
                 changed = prior[0] != digest
                 changed_fields = ["content"] if changed else []
-        self.db.execute("insert or ignore into snapshots values(?,?,?,?,?)", (org, family, digest, fetched, encoded))
-        self.db.execute("insert into current_sources values(?,?,?,?,?) on conflict(org,family) do update set digest=excluded.digest,fetched_at=excluded.fetched_at,payload=excluded.payload", (org,family,digest,fetched,encoded))
+        self.db.execute("insert or ignore into snapshots values(?,?,?,?,?,?,?)", (org, family, source_key, source_url, digest, fetched, encoded))
+        self.db.execute("insert into current_sources values(?,?,?,?,?,?) on conflict(org,family,source_key) do update set digest=excluded.digest,fetched_at=excluded.fetched_at,payload=excluded.payload", (org,family,source_key,digest,fetched,encoded))
         self.db.commit()
-        return {"id": f"{family}:{digest[:16]}", "family": family, "organisation_number": org, "url": source_url, "retrieved_at": fetched, "sha256": digest, "license": "NLOD 2.0" if "brreg.no" in urllib.parse.urlparse(source_url).netloc else "source terms apply", "changed": changed, "changed_fields": changed_fields, "previous_sha256": prior[0] if prior else None}
+        return {"id": f"{family}:{source_key_hash}:{digest[:16]}", "family": family, "organisation_number": org, "url": source_url, "retrieved_at": fetched, "sha256": digest, "license": "NLOD 2.0" if "brreg.no" in parsed.netloc else "source terms apply", "changed": changed, "changed_fields": changed_fields, "previous_sha256": prior[0] if prior else None}
 
     def company(self, org: str) -> dict[str, Any]:
         org = normalize_org(org)
@@ -717,6 +780,15 @@ class Agent:
         try:
             raw_site = site if site.startswith(("https://", "http://")) else "https://" + site
             parsed = urllib.parse.urlparse(raw_site)
+            # Registry sites still receive the normal HTTPS-only protections;
+            # upgrade an HTTP declaration rather than rejecting it outright.
+            if parsed.scheme == "http":
+                host = parsed.hostname or ""
+                if ":" in host:
+                    host = f"[{host}]"
+                if parsed.port not in (None, 80):
+                    host += f":{parsed.port}"
+                parsed = parsed._replace(scheme="https", netloc=host)
             safe_url = parsed.scheme == "https" and bool(parsed.hostname) and parsed.port in (None,443) and not parsed.username and not parsed.password and public_host(parsed.hostname or "")
         except (TypeError, ValueError) as exc:
             env["errors"].append({"source": str(site), "type": "invalid_website_url", "message": str(exc)})
@@ -728,6 +800,11 @@ class Agent:
             claim("web_presence", "ambiguous", reason="Registry website URL is not safe HTTPS")
             claim("jobs", "not_available", reason="Website URL was not crawled")
             claim("public_activity", "not_available", reason="Website URL was not crawled")
+            return
+        if is_directory_host(parsed.hostname or ""):
+            claim("web_presence", "ambiguous", reason="Candidate is a third-party business directory, not a company-owned website")
+            claim("jobs", "not_available", reason="Directory pages are not treated as the company's careers source")
+            claim("public_activity", "not_available", reason="Directory pages are not treated as the company's public-activity source")
             return
         url = urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path or "/", "", "", ""))
         robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
@@ -785,14 +862,54 @@ class Agent:
             p=PageParser(url); p.feed(text)
             title=" ".join(p.title).strip()
             page_text=" ".join(p.text)
-            # A registry-declared or exact-identifier-discovered domain is a lead,
-            # not identity proof. Require the full legal name (including or
-            # excluding its legal-form suffix) somewhere on the page, or the exact
-            # organisation number. This recovers footer/about-page identities
-            # without accepting partial name overlap.
+            # A search-result URL is a lead, not identity proof. Even if its
+            # homepage mentions the company, require a same-host legal/contact
+            # page corroborating the entity before publishing it as the company's site.
             identity_heading = " ".join(p.title + p.h1)
             name_match = legal_name_matches_page(legal_name, page_text, identity_heading)
             org_match = page_has_organisation_number(page_text, org)
+            identity_support_ids: list[str] = []
+            if require_domain_name_match or not (name_match or org_match):
+                legal_links = []
+                for href, caption in p.links:
+                    full = urllib.parse.urlparse(href)
+                    if (full.scheme == "https" and full.hostname == parsed.hostname
+                            and re.search(r"about|contact|legal|privacy|company|organisation|organization|om-oss|personvern|vilkar|imprint", full.path + " " + caption, re.I)):
+                        legal_links.append(urllib.parse.urlunparse((full.scheme, full.netloc, full.path, "", "", "")))
+                for support_url in list(dict.fromkeys(legal_links))[:3]:
+                    if not parser.can_fetch(UA, support_url):
+                        continue
+                    env["operations"]["requests"] += 1
+                    support_req = urllib.request.Request(support_url, headers={"User-Agent": UA, "Accept": "text/html"})
+                    try:
+                        with open_safe(support_req, parsed.hostname, self.timeout, on_retry=count_retry) as support_response:
+                            if urllib.parse.urlparse(support_response.geturl()).hostname != parsed.hostname:
+                                continue
+                            support_body = support_response.read(500_001)
+                            if len(support_body) > 500_000 or support_response.headers.get_content_type() not in ("text/html", "application/xhtml+xml"):
+                                continue
+                        support_parser = PageParser(support_url)
+                        support_parser.feed(support_body.decode("utf-8", errors="replace"))
+                        support_text = " ".join(support_parser.text)
+                        support_heading = " ".join(support_parser.title + support_parser.h1)
+                        if not (legal_name_matches_page(legal_name, support_text, support_heading)
+                                or page_has_organisation_number(support_text, org)):
+                            continue
+                        support_snap = self.snapshot(org, "website", support_url, support_body,
+                                                     {"title": support_heading, "text": support_text[:8000], "identity_page": True})
+                        env["source_snapshots"].append(support_snap)
+                        if support_snap["changed"]:
+                            env["changes"].append({"family": "web_presence", "source_id": support_snap["id"],
+                                "previous_sha256": support_snap["previous_sha256"], "sha256": support_snap["sha256"],
+                                "changed_fields": support_snap["changed_fields"]})
+                        env["evidence"].append({"id": support_snap["id"], "source_id": support_snap["id"],
+                            "excerpt": (support_heading + " — " + support_text[:500])[:600],
+                            "claim_fields": ["website_url", "website_identity"]})
+                        identity_support_ids.append(support_snap["id"])
+                        break
+                    except Exception as support_exc:
+                        env["errors"].append({"source": support_url, "type": "identity_page_error", "message": str(support_exc)[:200]})
+                name_match = bool(identity_support_ids)
             domain_match = domain_matches_legal_name(parsed.hostname or "", legal_name)
             snap=self.snapshot(org,"website",url,body,{"title":title,"text":page_text[:8000]})
             env["source_snapshots"].append(snap)
@@ -801,8 +918,13 @@ class Agent:
             profile_excerpt = " Company-site profile links: " + ", ".join(item["url"] for item in profile_links) if profile_links else ""
             ev={"id":snap["id"],"source_id":snap["id"],"excerpt":(title+" — "+page_text[:380]+profile_excerpt)[:600],"claim_fields":["website_url","website_title","website_description","company_profile_url"]}
             env["evidence"].append(ev)
-            if (name_match or org_match) and (not require_domain_name_match or domain_match):
-                facts=[{"field":"website_url","value":url,"evidence_ids":[snap["id"]],"observed_at":snap["retrieved_at"],"valid_at":None},
+            # A discovered candidate requires corroboration on its own
+            # identity/legal page. The homepage may be a marketplace listing,
+            # an article that mentions the company, or a product code containing
+            # the organisation number.
+            identity_verified = bool(identity_support_ids) if require_domain_name_match else (name_match or org_match)
+            if identity_verified:
+                facts=[{"field":"website_url","value":url,"evidence_ids":[snap["id"], *identity_support_ids],"observed_at":snap["retrieved_at"],"valid_at":None},
                        {"field":"website_title","value":title or urllib.parse.urlparse(url).hostname,"evidence_ids":[snap["id"]],"observed_at":snap["retrieved_at"],"valid_at":None}]
                 if p.meta_description: facts.append({"field":"website_description","value":p.meta_description,"evidence_ids":[snap["id"]],"observed_at":snap["retrieved_at"],"valid_at":None})
                 facts.extend({"field":"company_profile_url","value":profile_link,"evidence_ids":[snap["id"]],"observed_at":snap["retrieved_at"],"valid_at":None} for profile_link in profile_links)
@@ -829,16 +951,76 @@ class Agent:
                     job_text=job_body.decode("utf-8",errors="replace")
                     job_parser=PageParser(job_url); job_parser.feed(job_text)
                     ats_links.extend(href for href,_caption in job_parser.links)
+                    job_schema = next((item for item in _jsonld_objects(job_parser)
+                                       if "jobposting" in _jsonld_types(item) and _jsonld_exact_entity(item, org, legal_name)), None)
                     job_title=" ".join(job_parser.h1).strip() or " ".join(job_parser.title).strip()
+                    if not job_title and job_schema and isinstance(job_schema.get("title"), str):
+                        job_title = job_schema["title"].strip()
                     job_words=" ".join(job_parser.text)
                     job_state = classify_job_page(job_words, job_parser.published_dates)
+                    generic_landing = is_generic_careers_title(job_title)
+                    if not job_state and generic_landing:
+                        detail_urls = []
+                        for href, caption in job_parser.links:
+                            detail = urllib.parse.urlparse(href)
+                            parts = [part for part in detail.path.split("/") if part]
+                            if (detail.scheme == "https" and detail.hostname == parsed.hostname
+                                    and len(parts) >= 2
+                                    and re.search(r"job|career|vacan|position|stilling|ledig|opening", detail.path + " " + caption, re.I)):
+                                detail_urls.append(urllib.parse.urlunparse((detail.scheme, detail.netloc, detail.path, "", "", "")))
+                        for detail_url in list(dict.fromkeys(detail_urls))[:1]:
+                            if not parser.can_fetch(UA, detail_url):
+                                continue
+                            env["operations"]["requests"] += 1
+                            detail_req = urllib.request.Request(detail_url, headers={"User-Agent": UA, "Accept": "text/html"})
+                            try:
+                                with open_safe(detail_req, parsed.hostname, self.timeout, on_retry=count_retry) as detail_response:
+                                    if urllib.parse.urlparse(detail_response.geturl()).hostname != parsed.hostname:
+                                        continue
+                                    detail_body = detail_response.read(500_001)
+                                    if len(detail_body) > 500_000 or detail_response.headers.get_content_type() not in ("text/html", "application/xhtml+xml"):
+                                        continue
+                                detail_parser = PageParser(detail_url)
+                                detail_parser.feed(detail_body.decode("utf-8", errors="replace"))
+                                detail_schema = next((item for item in _jsonld_objects(detail_parser)
+                                    if "jobposting" in _jsonld_types(item) and _jsonld_exact_entity(item, org, legal_name)), None)
+                                detail_text = " ".join(detail_parser.text)
+                                detail_title = " ".join(detail_parser.h1).strip() or " ".join(detail_parser.title).strip()
+                                if not detail_title and detail_schema and isinstance(detail_schema.get("title"), str):
+                                    detail_title = detail_schema["title"].strip()
+                                detail_state = classify_job_page(detail_text, detail_parser.published_dates)
+                                if detail_schema and detail_state is None:
+                                    expiry = _iso_date(str(detail_schema.get("validThrough") or "")[:10])
+                                    posted = _iso_date(str(detail_schema.get("datePosted") or "")[:10])
+                                    if expiry and expiry >= date.today().isoformat() and (detail_schema.get("directApply") is True or detail_schema.get("applicationUrl")):
+                                        detail_state = {"field": "active_job_title", "freshness": "confirmed", "valid_at": posted or expiry}
+                                if detail_title and detail_state:
+                                    job_url, job_body, job_parser, job_words = detail_url, detail_body, detail_parser, detail_text
+                                    job_title, job_state, job_schema = detail_title, detail_state, detail_schema
+                                    ats_links.extend(href for href, _caption in detail_parser.links)
+                                    break
+                            except Exception as detail_exc:
+                                env["errors"].append({"source": detail_url, "type": "job_detail_error", "message": str(detail_exc)[:200]})
+                    if job_schema and job_state is None:
+                        valid_through = _iso_date(str(job_schema.get("validThrough") or "")[:10])
+                        posted = _iso_date(str(job_schema.get("datePosted") or "")[:10])
+                        direct_apply = job_schema.get("directApply") is True or bool(job_schema.get("applicationUrl"))
+                        if valid_through and valid_through >= date.today().isoformat() and direct_apply:
+                            job_state = {"field": "active_job_title", "freshness": "confirmed",
+                                         "valid_at": posted or valid_through}
                     if job_title and (job_state or is_generic_careers_title(job_title)):
-                        job_snap=self.snapshot(org,"jobs",job_url,job_body,{"title":job_title,"text":job_words[:3000]})
+                        job_payload = {"title": job_title, "text": job_words[:3000]}
+                        if job_schema:
+                            job_payload["jobposting"] = {key: job_schema.get(key) for key in ("title", "datePosted", "validThrough", "directApply", "applicationUrl") if job_schema.get(key) is not None}
+                        job_snap=self.snapshot(org,"jobs",job_url,job_body,job_payload)
                         env["source_snapshots"].append(job_snap)
                         if job_snap["changed"]: env["changes"].append({"family":"jobs","source_id":job_snap["id"],"previous_sha256":job_snap["previous_sha256"],"sha256":job_snap["sha256"],"changed_fields":job_snap["changed_fields"]})
                         generic_careers = is_generic_careers_title(job_title)
                         job_field = "careers_page_url" if generic_careers else job_state["field"]
-                        env["evidence"].append({"id":job_snap["id"],"source_id":job_snap["id"],"excerpt":(job_title+" — "+job_words[:500])[:600],"claim_fields":[job_field]})
+                        evidence_excerpt = job_title + " — " + job_words[:350]
+                        if job_schema:
+                            evidence_excerpt += f" — structured JobPosting; datePosted={job_schema.get('datePosted')}; validThrough={job_schema.get('validThrough')}"
+                        env["evidence"].append({"id":job_snap["id"],"source_id":job_snap["id"],"excerpt":evidence_excerpt[:600],"claim_fields":[job_field]})
                         job_value = job_url if generic_careers else {"title":job_title,"freshness":job_state["freshness"]}
                         job_facts.append({"field":job_field,"value":job_value,"evidence_ids":[job_snap["id"]],"observed_at":job_snap["retrieved_at"],"valid_at":None if generic_careers else job_state["valid_at"],"source_url":job_url})
                 # Follow only public ATS boards explicitly linked from the company
@@ -904,23 +1086,74 @@ class Agent:
                                 continue
                         activity_parser = PageParser(activity_url)
                         activity_parser.feed(activity_body.decode("utf-8", errors="replace"))
+                    parsed_article = next((item for item in _jsonld_objects(activity_parser)
+                        if _jsonld_types(item) & {"article", "newsarticle", "blogposting"}
+                        and _jsonld_exact_entity(item, org, legal_name)), None)
+                    has_date = any(_iso_date(value[:10]) for value in activity_parser.published_dates)
+                    if activity_url != url and not (parsed_article and (has_date or _iso_date(str(parsed_article.get("datePublished") or "")[:10]))):
+                        detail_urls = []
+                        for href, caption in activity_parser.links:
+                            detail = urllib.parse.urlparse(href)
+                            parts = [part for part in detail.path.split("/") if part]
+                            if (detail.scheme == "https" and detail.hostname == parsed.hostname and len(parts) >= 2
+                                    and re.search(r"news|press|blog|article|aktuelt|nyhet|update", detail.path + " " + caption, re.I)):
+                                detail_urls.append(urllib.parse.urlunparse((detail.scheme, detail.netloc, detail.path, "", "", "")))
+                        for detail_url in list(dict.fromkeys(detail_urls))[:1]:
+                            if detail_url == activity_url or not parser.can_fetch(UA, detail_url):
+                                continue
+                            env["operations"]["requests"] += 1
+                            detail_req = urllib.request.Request(detail_url, headers={"User-Agent": UA, "Accept": "text/html"})
+                            try:
+                                with open_safe(detail_req, parsed.hostname, self.timeout, on_retry=count_retry) as detail_response:
+                                    if urllib.parse.urlparse(detail_response.geturl()).hostname != parsed.hostname:
+                                        continue
+                                    detail_body = detail_response.read(500_001)
+                                    if len(detail_body) > 500_000 or detail_response.headers.get_content_type() not in ("text/html", "application/xhtml+xml"):
+                                        continue
+                                detail_parser = PageParser(detail_url)
+                                detail_parser.feed(detail_body.decode("utf-8", errors="replace"))
+                                detail_article = next((item for item in _jsonld_objects(detail_parser)
+                                    if _jsonld_types(item) & {"article", "newsarticle", "blogposting"}
+                                    and _jsonld_exact_entity(item, org, legal_name)), None)
+                                detail_date = next((value[:10] for value in detail_parser.published_dates if _iso_date(value[:10])), None)
+                                if detail_article and not detail_date:
+                                    detail_date = _iso_date(str(detail_article.get("datePublished") or "")[:10])
+                                detail_text = " ".join(detail_parser.text)
+                                detail_heading = " ".join(detail_parser.title + detail_parser.h1)
+                                if detail_date and (detail_article or legal_name_matches_page(legal_name, detail_text, detail_heading)
+                                                    or page_has_organisation_number(detail_text, org)):
+                                    activity_url, activity_body, activity_parser = detail_url, detail_body, detail_parser
+                                    parsed_article = detail_article
+                                    break
+                            except Exception as detail_exc:
+                                env["errors"].append({"source": detail_url, "type": "activity_detail_error", "message": str(detail_exc)[:200]})
                     activity_heading = " ".join(activity_parser.title + activity_parser.h1)
                     activity_text = " ".join(activity_parser.text)
                     exact_name = legal_name_matches_page(legal_name, activity_text, activity_heading)
                     exact_org = page_has_organisation_number(activity_text, org)
-                    if not (exact_name or exact_org):
+                    article = next((item for item in _jsonld_objects(activity_parser)
+                                    if _jsonld_types(item) & {"article", "newsarticle", "blogposting"}
+                                    and _jsonld_exact_entity(item, org, legal_name)), parsed_article)
+                    if not (exact_name or exact_org or article):
                         continue
                     published = next((value[:10] for value in activity_parser.published_dates if _iso_date(value[:10])), None)
+                    if not published and article:
+                        published = _iso_date(str(article.get("datePublished") or "")[:10])
                     if not published:
                         continue
-                    activity_title = activity_heading.strip()
+                    activity_title = (str(article.get("headline") or article.get("name") or "").strip()
+                                      if article else activity_heading.strip())
                     if not activity_title:
                         continue
-                    activity_snap = self.snapshot(org, "public_activity", activity_url, activity_body, {"title": activity_title, "published_at": published, "text": activity_text[:3000]})
+                    activity_payload = {"title": activity_title, "published_at": published, "text": activity_text[:3000]}
+                    if article:
+                        activity_payload["article"] = {key: article.get(key) for key in ("headline", "name", "datePublished") if article.get(key) is not None}
+                    activity_snap = self.snapshot(org, "public_activity", activity_url, activity_body, activity_payload)
                     env["source_snapshots"].append(activity_snap)
                     if activity_snap["changed"]:
                         env["changes"].append({"family": "public_activity", "source_id": activity_snap["id"], "previous_sha256": activity_snap["previous_sha256"], "sha256": activity_snap["sha256"], "changed_fields": activity_snap["changed_fields"]})
-                    env["evidence"].append({"id": activity_snap["id"], "source_id": activity_snap["id"], "excerpt": f"{published} — {activity_title}: {activity_text[:400]}"[:600], "claim_fields": ["public_activity"]})
+                    article_context = " — JSON-LD publisher entity verified" if article else ""
+                    env["evidence"].append({"id": activity_snap["id"], "source_id": activity_snap["id"], "excerpt": f"{published} — {activity_title}: {activity_text[:350]}{article_context}"[:600], "claim_fields": ["public_activity"]})
                     activity_facts.append({"field": "company_activity", "value": {"title": activity_title, "published_at": published}, "evidence_ids": [activity_snap["id"]], "observed_at": activity_snap["retrieved_at"], "valid_at": published, "source_url": activity_url})
                 # Prefer a feed the company site explicitly advertises. This
                 # improves coverage on sites whose homepage links do not expose
@@ -987,8 +1220,8 @@ class Agent:
                         env["evidence"].append({"id": feed_snap["id"], "source_id": feed_snap["id"], "excerpt": "Company-advertised activity feed: " + " | ".join(feed_excerpts)[:550], "claim_fields": ["public_activity"]})
                 claim("public_activity", "available" if activity_facts else "not_available", activity_facts, None if activity_facts else "No dated, entity-matched company news or activity page was verified")
             else:
-                reason = ("Open-web candidate domain did not match a distinctive legal-name token" if
-                          require_domain_name_match and not domain_match else
+                reason = ("Search candidate lacks same-host legal/contact evidence tying it to the exact legal entity"
+                          if require_domain_name_match else
                           "Website does not independently identify the exact legal entity")
                 claim("web_presence","ambiguous",reason=reason)
                 claim("jobs","not_available",reason="Website entity match failed; no jobs published")
@@ -1071,7 +1304,8 @@ class Agent:
             if family not in present:
                 env["claims"].append({"family": family, "status": "failed", "facts": [], "reason": "No terminal result was produced for this information family"})
                 env["errors"].append({"type": "internal_error", "message": f"Missing terminal claim for {family}; emitted a failed status"})
-        env["summary"] = self._summary(env)
+        if not (isinstance(env.get("summary"), dict) and env["summary"].get("method", "").startswith("optional LLM summary")):
+            env["summary"] = self._summary(env)
         return env
 
     @staticmethod
@@ -1279,6 +1513,11 @@ def main() -> int:
     ap.add_argument("--no-website",action="store_true")
     ap.add_argument("--timeout",type=float,default=12)
     ap.add_argument("--workers",type=int,default=4,help="Concurrent company lookups (default: 4)")
+    ap.add_argument("--deadline-seconds", type=int, default=2400, help="Batch collection deadline in seconds (default: 2400)")
+    ap.add_argument("--finalization-reserve-seconds", type=int, default=120, help="Reserve this much time to finish outputs and dashboard (default: 120)")
+    ap.add_argument("--max-outbound-requests", type=int, default=2000, help="Run-wide outbound HTTP request cap (default: 2000; competition maximum: 2000)")
+    ap.add_argument("--checkpoint", type=Path, help="JSONL checkpoint path (defaults beside the output)")
+    ap.add_argument("--resume", action="store_true", help="Resume completed company fetches from the checkpoint")
     ap.add_argument("--web-search-judge",action="store_true",help="Opt in to one OpenAI web-search call per valid company; results are unverified candidates, never facts")
     ap.add_argument("--nav-jobs",action="store_true",help="Enable a bounded NAV public-job-feed scan over up to six months of active-ad updates")
     ap.add_argument("--nav-pages",type=int,default=25,help="Maximum NAV feed pages when --nav-jobs is enabled (default: 25; hard cap: 100)")
@@ -1295,6 +1534,12 @@ def main() -> int:
     args=ap.parse_args()
     if args.workers < 1 or args.workers > 16:
         ap.error("--workers must be between 1 and 16")
+    if args.deadline_seconds < 1 or args.finalization_reserve_seconds < 0 or args.finalization_reserve_seconds >= args.deadline_seconds:
+        ap.error("--deadline-seconds must be positive and greater than --finalization-reserve-seconds")
+    if args.max_outbound_requests < 1 or args.max_outbound_requests > 2000:
+        ap.error("--max-outbound-requests must be between 1 and 2000")
+    if args.web_search_judge:
+        ap.error("--web-search-judge is excluded from the submission pipeline: its search claims are candidate-only and do not enter the scored, evidence-backed claims")
     if args.wikidata_websites and args.no_website:
         ap.error("--wikidata-websites requires website fetching; remove --no-website")
     if args.brave_websites and args.no_website:
@@ -1327,13 +1572,12 @@ def main() -> int:
     except (OSError, ValueError) as exc:
         ap.error(f"could not read input batch: {exc}")
     args.output.parent.mkdir(parents=True,exist_ok=True)
+    checkpoint_path = args.checkpoint or args.output.with_suffix(args.output.suffix + ".checkpoint.jsonl")
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    protected_paths = {args.input.resolve(), args.output.resolve(), args.state.resolve()}
+    if checkpoint_path.resolve() in protected_paths:
+        ap.error("--checkpoint must be a different file from input, output, and state")
     judge = None
-    if args.web_search_judge:
-        try:
-            from claim_judge import WebSearchJudge
-            judge = WebSearchJudge(max_calls=1)
-        except Exception as exc:
-            ap.error(f"could not enable web-search judge: {exc}")
     brave = None
     if args.brave_websites:
         if os.environ.get("SIGNALPOST_BRAVE_STORAGE_RIGHTS", "").strip().lower() not in {"1", "true", "yes"}:
@@ -1360,33 +1604,94 @@ def main() -> int:
             summary_agent = LLMSummaryAgent(timeout=min(args.timeout + 15, 45))
         except Exception as exc:
             ap.error(f"could not enable LLM summary: {exc}")
+    activate_request_budget(args.max_outbound_requests)
     agent=Agent(args.state,not args.no_website,args.timeout)
     n=0
     started_batch=time.monotonic()
+    work_deadline = started_batch + args.deadline_seconds - args.finalization_reserve_seconds
     def process(org: str) -> dict[str, Any]:
         worker_agent=Agent(args.state,not args.no_website,args.timeout)
         try:
             result=worker_agent.company(org)
-            if judge and result.get("identity_anchor", {}).get("status") == "verified":
-                candidates = judge.discover(org,result["identity_anchor"].get("legal_name") or "")
-                candidates = judge.verify_citations(candidates, org, result["identity_anchor"].get("legal_name") or "")
-                result["web_search_candidates"] = candidates
-                result["operations"]["requests"] += candidates.get("calls_made", 0) + candidates.get("verification_requests", 0)
-                if candidates.get("calls_made", 0):
-                    result["operations"]["third_party_cost_usd"] = None
-                    result["operations"]["third_party_cost_note"] = "Provider cost was not measured; check the OpenAI usage dashboard."
             return result
         except Exception as exc:
             failed_at=now()
             return {"organisation_number":org,"identity_anchor":{"organisation_number":org,"status":"failed"},"claims":[{"family":family,"status":"failed","facts":[],"reason":"Unexpected per-company processing error"} for family in FAMILIES],"evidence":[],"source_snapshots":[],"errors":[{"type":"internal_error","message":str(exc)}],"changes":[],"summary":{"text":"No verified company facts are available because processing failed.","evidence_ids":[],"unknown_families":list(FAMILIES),"method":"deterministic evidence-grounded summary"},"run":{"id":str(uuid.uuid4()),"started_at":failed_at,"finished_at":failed_at,"status":"complete"},"operations":{"requests":0,"runtime_ms":0,"third_party_cost_usd":0.0}}
         finally:
             worker_agent.db.close()
-    with ThreadPoolExecutor(max_workers=(1 if judge else args.workers)) as pool:
-        results = list(pool.map(process, orgs))
+    results: list[dict[str, Any] | None] = [None] * len(orgs)
+    if args.resume and checkpoint_path.exists():
+        try:
+            for line_number, line in enumerate(checkpoint_path.read_text(encoding="utf-8").splitlines(), 1):
+                record = json.loads(line)
+                index = record.get("index")
+                if (not isinstance(index, int) or index < 0 or index >= len(orgs)
+                        or record.get("organisation_number") != orgs[index]
+                        or not isinstance(record.get("profile"), dict)
+                        or record["profile"].get("organisation_number") != orgs[index]):
+                    raise ValueError(f"checkpoint line {line_number} does not match this input batch")
+                results[index] = record["profile"]
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            ap.error(f"could not resume checkpoint: {exc}")
+    resumed_profiles = sum(result is not None for result in results)
+    pending_indices = [index for index, result in enumerate(results) if result is None]
+    deadline_hit = False
+    with checkpoint_path.open("a" if args.resume else "w", encoding="utf-8") as checkpoint_file:
+        pool = ThreadPoolExecutor(max_workers=args.workers)
+        active: dict[Any, int] = {}
+        next_position = 0
+        while next_position < len(pending_indices) or active:
+            while next_position < len(pending_indices) and len(active) < args.workers and time.monotonic() < work_deadline:
+                index = pending_indices[next_position]
+                active[pool.submit(process, orgs[index])] = index
+                next_position += 1
+            if not active:
+                deadline_hit = next_position < len(pending_indices)
+                break
+            remaining = max(0.0, work_deadline - time.monotonic())
+            done, _ = wait(active, timeout=remaining, return_when=FIRST_COMPLETED)
+            if not done:
+                deadline_hit = True
+                break
+            for future in done:
+                index = active.pop(future)
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = process(orgs[index])
+                    result.setdefault("errors", []).append({"type": "checkpoint_worker_error", "message": type(exc).__name__})
+                results[index] = result
+                checkpoint_file.write(json.dumps({"index": index, "organisation_number": orgs[index], "profile": result}, ensure_ascii=False) + "\n")
+                checkpoint_file.flush()
+        if deadline_hit:
+            for future in active:
+                future.cancel()
+        # At most one worker wave is left in flight; let those bounded requests
+        # finish before SQLite state is closed, then save their results too.
+        pool.shutdown(wait=True, cancel_futures=True)
+        for future, index in list(active.items()):
+            if future.cancelled():
+                continue
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = process(orgs[index])
+                result.setdefault("errors", []).append({"type": "checkpoint_worker_error", "message": type(exc).__name__})
+            results[index] = result
+            checkpoint_file.write(json.dumps({"index": index, "organisation_number": orgs[index], "profile": result}, ensure_ascii=False) + "\n")
+            checkpoint_file.flush()
+    for index, result in enumerate(results):
+        if result is None:
+            results[index] = {"organisation_number": orgs[index], "identity_anchor": {"organisation_number": orgs[index], "status": "failed"},
+                "claims": [{"family": family, "status": "failed", "facts": [], "reason": "Batch collection deadline reached before this company was processed"} for family in FAMILIES],
+                "errors": [{"type": "batch_deadline", "message": "Collection stopped at the configured deadline; rerun with --resume to continue from checkpoint"}],
+                "evidence": [], "source_snapshots": [], "changes": [], "summary": {"text": "No verified company facts are available because the batch deadline was reached.", "evidence_ids": [], "unknown_families": list(FAMILIES), "method": "deterministic evidence-grounded summary"},
+                "run": {"id": str(uuid.uuid4()), "started_at": now(), "finished_at": now(), "status": "complete"},
+                "operations": {"requests": 0, "runtime_ms": 0, "third_party_cost_usd": 0.0}}
     wikidata_report = {"status": "disabled", "requests": 0, "target_count": 0, "candidate_count": 0, "errors": []}
-    if args.wikidata_websites and results:
+    if args.wikidata_websites and results and time.monotonic() < work_deadline:
         discovery = WikidataWebsiteDiscovery(timeout=min(args.timeout, 8))
-        candidates, wikidata_report = discovery.discover(results)
+        candidates, wikidata_report = discovery.discover(results, deadline=work_deadline)
         results[0].setdefault("operations", {}).setdefault("shared_requests", 0)
         results[0]["operations"]["shared_requests"] += wikidata_report.get("requests", 0)
         # Apply only candidates whose Wikidata entity has the exact requested
@@ -1428,22 +1733,22 @@ def main() -> int:
             agent.website(org, candidate["site"], (result.get("identity_anchor") or {}).get("legal_name") or "", result, add_site_claim)
             prior_runtime = result.get("operations", {}).get("runtime_ms", 0)
             agent.finish(result, time.monotonic() - prior_runtime / 1000)
+    elif args.wikidata_websites and results:
+        wikidata_report = {"status": "deadline_deferred", "requests": 0, "target_count": 0,
+                           "candidate_count": 0, "errors": [], "deadline_reached": True}
     tinyfish_report = {"status": "disabled", "requests": 0, "target_count": 0,
                        "candidate_count": 0, "verified_candidate_count": 0,
                        "estimated_cost_usd": 0.0, "errors": []}
     if tinyfish and results:
-        failed_wikidata = set(wikidata_report.get("failed_organisations", []))
         candidate_count = verified_count = searched = 0
+        deadline_limited = False
         for index, original in enumerate(results):
+            if time.monotonic() >= work_deadline:
+                deadline_limited = True
+                break
             org = str(original.get("organisation_number") or "")
             anchor = original.get("identity_anchor") or {}
-            if anchor.get("status") != "verified" or org in failed_wikidata:
-                continue
-            details = next((item for item in original.get("claims", []) if item.get("family") == "company_details"), {})
-            registered_site = any(fact.get("field") == "website" and fact.get("value")
-                                  for fact in details.get("facts", []))
-            discovery_state = original.get("website_discovery") or {}
-            if registered_site or discovery_state.get("status") != "not_found":
+            if anchor.get("status") != "verified" or has_verified_website(original):
                 continue
             searched += 1
             search_result = tinyfish.discover(org, str(anchor.get("legal_name") or ""))
@@ -1503,28 +1808,27 @@ def main() -> int:
                 prior_runtime = target.get("operations", {}).get("runtime_ms", 0)
                 agent.finish(target, time.monotonic() - prior_runtime / 1000)
             results[index] = target
-        tinyfish_report = {"status": "complete" if not tinyfish.errors else "partial" if tinyfish.requests else "failed",
+        tinyfish_report = {"status": "partial" if deadline_limited else "complete" if not tinyfish.errors else "partial" if tinyfish.requests else "failed",
                            "requests": tinyfish.requests, "target_count": searched,
                            "candidate_count": candidate_count, "verified_candidate_count": verified_count,
                            "estimated_cost_usd": 0.0, "candidate_urls_retained": False,
                            "pricing_note": "Search was documented as free at implementation time; verify current provider terms.",
-                           "errors": tinyfish.errors}
+                           "errors": tinyfish.errors, "deadline_limited": deadline_limited}
+    elif tinyfish and results:
+        tinyfish_report["status"] = "deadline_deferred"
     tavily_report = {"status": "disabled", "requests": 0, "credits_used": 0,
                      "target_count": 0, "candidate_count": 0,
                      "verified_candidate_count": 0, "estimated_cost_usd": 0.0, "errors": []}
     if tavily and results:
-        failed_wikidata = set(wikidata_report.get("failed_organisations", []))
         candidate_count = verified_count = searched = budget_exhausted_targets = 0
+        deadline_limited = False
         for index, original in enumerate(results):
+            if time.monotonic() >= work_deadline:
+                deadline_limited = True
+                break
             org = str(original.get("organisation_number") or "")
             anchor = original.get("identity_anchor") or {}
-            if anchor.get("status") != "verified" or org in failed_wikidata:
-                continue
-            details = next((item for item in original.get("claims", []) if item.get("family") == "company_details"), {})
-            registered_site = any(fact.get("field") == "website" and fact.get("value")
-                                  for fact in details.get("facts", []))
-            discovery_state = original.get("website_discovery") or {}
-            if registered_site or discovery_state.get("status") != "not_found":
+            if anchor.get("status") != "verified" or has_verified_website(original):
                 continue
             search_result = tavily.discover(org, str(anchor.get("legal_name") or ""))
             if search_result.get("requests", 0):
@@ -1566,30 +1870,29 @@ def main() -> int:
                 prior_runtime = target.get("operations", {}).get("runtime_ms", 0)
                 agent.finish(target, time.monotonic() - prior_runtime / 1000)
             results[index] = target
-        tavily_report = {"status": "partial" if tavily.errors or budget_exhausted_targets else "complete" if tavily.requests else "failed",
+        tavily_report = {"status": "partial" if deadline_limited or tavily.errors or budget_exhausted_targets else "complete" if tavily.requests else "failed",
                          "requests": tavily.requests, "credits_used": tavily.credits_used,
                          "target_count": searched, "candidate_count": candidate_count,
                          "verified_candidate_count": verified_count, "estimated_cost_usd": 0.0,
                          "budget_exhausted_targets": budget_exhausted_targets,
-                         "candidate_urls_retained": False, "errors": tavily.errors}
+                         "candidate_urls_retained": False, "errors": tavily.errors, "deadline_limited": deadline_limited}
+    elif tavily and results:
+        tavily_report["status"] = "deadline_deferred"
     brave_report = {"status": "disabled", "requests": 0, "target_count": 0,
                     "candidate_count": 0, "verified_candidate_count": 0,
                     "estimated_cost_usd": 0.0, "errors": []}
     if brave and results:
-        failed_wikidata = set(wikidata_report.get("failed_organisations", []))
         candidate_count = verified_count = 0
         estimated_cost = 0.0
         searched = 0
+        deadline_limited = False
         for index, original in enumerate(results):
+            if time.monotonic() >= work_deadline:
+                deadline_limited = True
+                break
             org = str(original.get("organisation_number") or "")
             anchor = original.get("identity_anchor") or {}
-            if anchor.get("status") != "verified" or org in failed_wikidata:
-                continue
-            details = next((item for item in original.get("claims", []) if item.get("family") == "company_details"), {})
-            registered_site = any(fact.get("field") == "website" and fact.get("value")
-                                  for fact in details.get("facts", []))
-            discovery_state = original.get("website_discovery") or {}
-            if registered_site or discovery_state.get("status") != "not_found":
+            if anchor.get("status") != "verified" or has_verified_website(original):
                 continue
             searched += 1
             search_result = brave.discover(org, str(anchor.get("legal_name") or ""))
@@ -1656,47 +1959,15 @@ def main() -> int:
             if verified_trial is None:
                 results[index] = target
             estimated_cost += search_result.get("estimated_cost_usd", 0.0)
-        brave_report = {"status": "complete" if not brave.errors else "partial" if brave.requests else "failed",
+        brave_report = {"status": "partial" if deadline_limited else "complete" if not brave.errors else "partial" if brave.requests else "failed",
                         "requests": brave.requests, "billable_requests": brave.billable_requests, "target_count": searched,
                         "candidate_count": candidate_count, "verified_candidate_count": verified_count,
                         "estimated_cost_usd": round(estimated_cost, 6),
-                        "candidate_urls_retained": False, "errors": brave.errors}
-    llm_summary_report = {"status": "disabled", "calls": 0, "accepted": 0,
-                          "rejected_or_failed": 0, "estimated_cost_usd": 0.0}
-    if summary_agent and results:
-        with ThreadPoolExecutor(max_workers=min(args.workers, 4)) as pool:
-            summaries = list(pool.map(summary_agent.summarize, results))
-        calls = accepted = rejected = 0
-        estimated_cost = 0.0
-        estimate_unknown = False
-        for result, generated in zip(results, summaries):
-            calls += generated.get("calls_made", 0)
-            if generated.get("summary"):
-                previous = result.get("summary") or {}
-                generated["summary"]["unknown_families"] = previous.get("unknown_families", [])
-                result["summary"] = generated["summary"]
-                accepted += 1
-            elif generated.get("calls_made", 0):
-                rejected += 1
-            result["summary_agent"] = {key: generated.get(key) for key in ("status", "model", "usage", "error") if generated.get(key) is not None}
-            result.setdefault("operations", {})["requests"] = result.get("operations", {}).get("requests", 0) + generated.get("calls_made", 0)
-            if generated.get("calls_made", 0):
-                estimate = generated.get("estimated_cost_usd")
-                if isinstance(estimate, (int, float)):
-                    estimated_cost += estimate
-                    prior = result["operations"].get("third_party_cost_estimate_usd", 0.0) or 0.0
-                    result["operations"]["third_party_cost_estimate_usd"] = round(prior + estimate, 8)
-                else:
-                    estimate_unknown = True
-                result["operations"]["third_party_cost_usd"] = None
-        llm_summary_report = {"status": "complete" if not rejected else "partial",
-                              "calls": calls, "accepted": accepted,
-                              "rejected_or_failed": rejected,
-                              "estimated_cost_usd": None if estimate_unknown else round(estimated_cost, 8),
-                              "model": summary_agent.model,
-                              "cost_note": "Estimate uses the published GPT-6 Luna input/output rates; refresh model pricing before an official run."}
+                        "candidate_urls_retained": False, "errors": brave.errors, "deadline_limited": deadline_limited}
+    elif brave and results:
+        brave_report["status"] = "deadline_deferred"
     nav_report = {"status": "disabled", "requests": 0, "matched_profiles": 0}
-    if args.nav_jobs and results:
+    if args.nav_jobs and results and time.monotonic() < work_deadline:
         nav_client = NavJobFeed(timeout=args.timeout, max_pages=args.nav_pages, max_details=args.nav_details, lookback_days=args.nav_days)
         nav_report = nav_client.enrich(results)
         # NAV is a batch-level shared source. Attribute its shared request cost
@@ -1723,6 +1994,44 @@ def main() -> int:
             prior_runtime = result.get("operations", {}).get("runtime_ms", 0)
             agent.finish(result, time.monotonic() - prior_runtime / 1000)
         agent.db.commit()
+    elif args.nav_jobs and results:
+        nav_report = {"status": "deadline_deferred", "requests": 0, "matched_profiles": 0}
+    llm_summary_report = {"status": "disabled", "calls": 0, "accepted": 0,
+                          "rejected_or_failed": 0, "estimated_cost_usd": 0.0}
+    if summary_agent and results and time.monotonic() < work_deadline:
+        with ThreadPoolExecutor(max_workers=min(args.workers, 4)) as pool:
+            summaries = list(pool.map(summary_agent.summarize, results))
+        calls = accepted = rejected = 0
+        estimated_cost = 0.0
+        estimate_unknown = False
+        for result, generated in zip(results, summaries):
+            calls += generated.get("calls_made", 0)
+            if generated.get("summary"):
+                previous = result.get("summary") or {}
+                generated["summary"]["unknown_families"] = previous.get("unknown_families", [])
+                result["summary"] = generated["summary"]
+                accepted += 1
+            elif generated.get("calls_made", 0):
+                rejected += 1
+            result["summary_agent"] = {key: generated.get(key) for key in ("status", "model", "usage", "error", "http_status", "retry_after") if generated.get(key) is not None}
+            result.setdefault("operations", {})["requests"] = result.get("operations", {}).get("requests", 0) + generated.get("calls_made", 0)
+            if generated.get("calls_made", 0):
+                estimate = generated.get("estimated_cost_usd")
+                if isinstance(estimate, (int, float)):
+                    estimated_cost += estimate
+                    prior = result["operations"].get("third_party_cost_estimate_usd", 0.0) or 0.0
+                    result["operations"]["third_party_cost_estimate_usd"] = round(prior + estimate, 8)
+                else:
+                    estimate_unknown = True
+                result["operations"]["third_party_cost_usd"] = None
+        llm_summary_report = {"status": "complete" if not rejected else "partial",
+                              "calls": calls, "accepted": accepted,
+                              "rejected_or_failed": rejected,
+                              "estimated_cost_usd": None if estimate_unknown else round(estimated_cost, 8),
+                              "model": summary_agent.model,
+                              "cost_note": "Estimate uses the published GPT-6 Luna input/output rates; refresh model pricing before an official run."}
+    elif summary_agent and results:
+        llm_summary_report = {"status": "deadline_deferred", "calls": 0, "accepted": 0, "rejected_or_failed": 0, "estimated_cost_usd": 0.0}
     with args.output.open("w",encoding="utf-8") as out:
         for result in results:
             out.write(json.dumps(result,ensure_ascii=False)+"\n"); out.flush(); n+=1
@@ -1730,14 +2039,14 @@ def main() -> int:
     dashboard=make_dashboard(args.output)
     states: dict[str,int] = {}
     families: dict[str,dict[str,int]] = {}
-    requests = runtime = 0
+    profile_reported_requests = runtime = 0
     errors = 0
     costs = 0.0
     cost_known = True
     for row in read_jsonl_records(args.output):
         anchor=(row.get("identity_anchor") or {}).get("status","unknown")
         states[anchor]=states.get(anchor,0)+1
-        requests += (row.get("operations") or {}).get("requests",0) + (row.get("operations") or {}).get("shared_requests",0)
+        profile_reported_requests += (row.get("operations") or {}).get("requests",0) + (row.get("operations") or {}).get("shared_requests",0)
         runtime += (row.get("operations") or {}).get("runtime_ms",0)
         row_cost = (row.get("operations") or {}).get("third_party_cost_usd",0)
         if row_cost is None:
@@ -1752,9 +2061,11 @@ def main() -> int:
     cost_status = ("provider charge unavailable; see estimate and usage records" if not cost_known else
                    "provider-published free tier; billing not independently verified" if tinyfish_report.get("requests", 0) else
                    "no paid provider calls")
-    report={"input_count":len(orgs),"output_count":n,"unique_input_count":len(set(orgs)),"all_inputs_have_terminal_result":n==len(orgs),"identity_status_counts":states,"family_status_counts":families,"requests":requests,"nav_job_feed":nav_report,"wikidata_website_discovery":wikidata_report,"tinyfish_website_discovery":tinyfish_report,"tavily_website_discovery":tavily_report,"brave_website_discovery":brave_report,"llm_summary":llm_summary_report,"runtime_ms_sum":runtime,"wall_runtime_ms":int((time.monotonic()-started_batch)*1000),"workers":1 if judge else args.workers,"errors":errors,"third_party_cost_usd":round(costs,6) if cost_known else None,"third_party_cost_estimate_usd":round(estimate_total,8),"third_party_cost_status":cost_status,"cost_basis":"TinyFish and Tavily usage must be checked against provider free-credit allowances; optional OpenAI and Brave costs are estimates from published rates and response usage, not billing records","output":str(args.output),"dashboard":str(dashboard)}
+    request_budget = request_budget_stats()
+    report={"input_count":len(orgs),"output_count":n,"unique_input_count":len(set(orgs)),"all_inputs_have_terminal_result":n==len(orgs),"identity_status_counts":states,"family_status_counts":families,"requests":request_budget["used"],"profile_reported_requests":profile_reported_requests,"outbound_request_budget":request_budget,"batch_deadline":{"seconds":args.deadline_seconds,"finalization_reserve_seconds":args.finalization_reserve_seconds,"reached":deadline_hit},"checkpoint":{"path":str(checkpoint_path),"resumed_profiles":resumed_profiles},"claim_judge":{"status":"excluded_from_competition_pipeline","reason":"Search results are not integrated as scored evidence-backed claims; the option is rejected to avoid candidate-only output being mistaken for published facts"},"nav_job_feed":nav_report,"wikidata_website_discovery":wikidata_report,"tinyfish_website_discovery":tinyfish_report,"tavily_website_discovery":tavily_report,"brave_website_discovery":brave_report,"llm_summary":llm_summary_report,"runtime_ms_sum":runtime,"wall_runtime_ms":int((time.monotonic()-started_batch)*1000),"workers":args.workers,"errors":errors,"third_party_cost_usd":round(costs,6) if cost_known else None,"third_party_cost_estimate_usd":round(estimate_total,8),"third_party_cost_status":cost_status,"cost_basis":"TinyFish and Tavily usage must be checked against provider free-credit allowances; optional OpenAI and Brave costs are estimates from published rates and response usage, not billing records","output":str(args.output),"dashboard":str(dashboard)}
     args.output.with_suffix(args.output.suffix+".report.json").write_text(json.dumps(report,indent=2,ensure_ascii=False)+"\n",encoding="utf-8")
     print(json.dumps(report,ensure_ascii=False))
+    deactivate_request_budget()
     return 0
 
 if __name__=="__main__": raise SystemExit(main())

@@ -61,15 +61,18 @@ class WikidataWebsiteTests(unittest.TestCase):
         self.assertEqual(mock_opener.open.call_count, 1)
         self.assertEqual(client.requests, 0)  # _query itself does not own batch accounting
 
-    def test_discovery_skips_unverified_and_registry_website_profiles(self):
+    def test_discovery_skips_unverified_and_only_skips_verified_website_profiles(self):
         client = WikidataWebsiteDiscovery(batch_size=1)
-        rows = [profile("923609016"), profile("987654321", "https://known.example"),
+        verified = profile("111111111")
+        verified["claims"].append({"family": "web_presence", "status": "available",
+                                   "facts": [{"field": "website_url", "value": "https://verified.example"}]})
+        rows = [profile("923609016"), profile("987654321", "https://known.example"), verified,
                 {"organisation_number": "123456789", "identity_anchor": {"status": "failed"}, "claims": []}]
         with patch.object(client, "_query", return_value=(b"{}", [])) as query:
             candidates, report = client.discover(rows)
-        query.assert_called_once_with(["923609016"])
+        self.assertEqual([call.args[0] for call in query.call_args_list], [["923609016"], ["987654321"]])
         self.assertFalse(candidates)
-        self.assertEqual(report["target_count"], 1)
+        self.assertEqual(report["target_count"], 2)
         self.assertEqual(report["status"], "complete")
 
     def test_query_failure_is_explicit_and_does_not_raise_out_of_batch(self):

@@ -130,13 +130,24 @@ class QARegressionTests(unittest.TestCase):
         self.assertEqual({x[0] for x in claims}, {"web_presence", "jobs", "public_activity"})
 
     def test_unsafe_website_urls_do_not_attempt_network_access(self):
-        for site in ("http://example.test", "https://user:pass@example.test", "https://example.test:444", "https://example.test:bad", "https://[::1"):
+        for site in ("https://user:pass@example.test", "https://example.test:444", "https://example.test:bad", "https://[::1"):
             with self.subTest(site=site), patch.object(sp, "public_host", return_value=True), patch.object(sp, "open_safe", side_effect=AssertionError("unsafe URL fetched")) as opener:
                 env = {"operations": {"requests": 0}, "errors": [], "source_snapshots": [], "evidence": [], "changes": []}
                 claims = []
                 self.agent.website("923609016", site, "Example AS", env, lambda *a, **k: claims.append(a))
             self.assertEqual({x[0] for x in claims}, {"web_presence", "jobs", "public_activity"})
             opener.assert_not_called()
+
+    def test_registered_http_site_is_upgraded_to_https_before_fetch(self):
+        robots = _Response(b"User-agent: *\nAllow: /", kind="robots")
+        homepage = _Response(b"<title>Example Company AS</title>")
+        with patch.object(sp, "public_host", return_value=True), patch.object(sp, "open_safe", side_effect=[robots, homepage]) as opener:
+            env = {"operations": {"requests": 0}, "errors": [], "source_snapshots": [], "evidence": [], "changes": []}
+            claims = []
+            self.agent.website("923609016", "http://example.test", "Example Company AS", env,
+                               lambda *a, **k: claims.append(a))
+        self.assertEqual(opener.call_args_list[0].args[0].full_url, "https://example.test/robots.txt")
+        self.assertEqual(opener.call_args_list[1].args[0].full_url, "https://example.test/")
 
     def test_robots_disallow_stops_before_homepage_fetch(self):
         robots = _Response(b"User-agent: *\nDisallow: /\n", kind="robots")
@@ -173,7 +184,7 @@ class QARegressionTests(unittest.TestCase):
 
         robots = Response(b"User-agent: *\nAllow: /\n", "https://replacement.example/robots.txt", "robots")
         homepage = Response(
-            b"<html><title>Example Company</title><h1>Example Company</h1></html>",
+            b"<html><title>Example Company AS</title><h1>Example Company AS</h1></html>",
             "https://replacement.example/",
         )
         env = {"operations": {"requests": 0}, "errors": [], "source_snapshots": [], "evidence": [], "changes": []}
@@ -251,6 +262,14 @@ class QARegressionTests(unittest.TestCase):
         self.assertEqual(report["input_count"], 2)
         self.assertEqual(report["output_count"], 2)
         self.assertTrue(report["all_inputs_have_terminal_result"])
+        checkpoint = output.with_suffix(output.suffix + ".checkpoint.jsonl")
+        self.assertTrue(checkpoint.exists())
+        resume_argv = argv + ["--resume"]
+        with patch.object(sys, "argv", resume_argv), patch.object(sp, "get_json", side_effect=AssertionError("resume should not refetch completed inputs")), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(sp.main(), 0)
+        resumed = json.loads(output.with_suffix(output.suffix + ".report.json").read_text(encoding="utf-8"))
+        self.assertEqual(resumed["checkpoint"]["resumed_profiles"], 2)
+        self.assertEqual(resumed["outbound_request_budget"]["used"], 0)
 
     def test_nok_financial_fields_reject_non_nok_currency_and_nan(self):
         org = "923609016"
