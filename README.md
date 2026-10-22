@@ -18,7 +18,7 @@ company-identity checks before facts are published. The option uses no paid API.
 If Wikidata is unreachable, the run records a discovery failure and still emits one
 result envelope per input.
 
-The included `--nav-jobs` scans up to 180 days of feed changes (NAV postings may remain active for up to six months), with a 25-page and 100-detail budget. Tune those limits with `--nav-days`, `--nav-pages`, and `--nav-details`; the feed may still report truncation and is not a complete jobs index. It makes no paid API calls.
+The included `--nav-jobs` scans up to 180 days of feed changes (NAV postings may remain active for up to six months), with a 100-page and 150-detail default budget. Exact legal-name candidates are checked before similar-name leads; every job still needs exact organization-number attribution or the existing exact-name plus location/homepage corroboration. A capped scan is marked partial and reports truncation instead of implying complete coverage. Tune the limits with `--nav-days`, `--nav-pages`, and `--nav-details`; this is not a complete jobs index and makes no paid API calls.
 
 When a verified company website explicitly links to a supported Greenhouse, Lever, or Ashby job board, the agent can query that provider's public job API. Each vacancy remains linked to both the verified company-site link and the canonical job-board record. This is bounded to three boards and 30 postings per board. The profile browser supports search, filtering, coverage sorting, source links and retrieval dates, and comparison of up to three companies. It is a local review artifact; it is not a hosted service.
 

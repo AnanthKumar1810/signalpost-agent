@@ -1,4 +1,5 @@
 import json
+import urllib.error
 import unittest
 from unittest.mock import patch
 
@@ -83,6 +84,31 @@ class WikidataWebsiteTests(unittest.TestCase):
         self.assertEqual(report["status"], "failed")
         self.assertEqual(report["requests"], 2)
         self.assertEqual(len(report["errors"]), 2)
+
+    def test_429_retries_once_when_retry_after_fits_bound(self):
+        client = WikidataWebsiteDiscovery(batch_size=1)
+        response = unittest.mock.Mock()
+        response.headers = {"Retry-After": "0"}
+        limited = urllib.error.HTTPError("https://query.wikidata.org/sparql", 429, "Too Many Requests", response.headers, None)
+        with patch.object(client, "_query", side_effect=[limited, (b"{}", [])]) as query:
+            candidates, report = client.discover([profile("923609016")])
+        self.assertFalse(candidates)
+        self.assertEqual(query.call_count, 2)
+        self.assertEqual(report["requests"], 2)
+        self.assertEqual(report["retry_count"], 1)
+        self.assertEqual(report["status"], "complete")
+
+    def test_429_retry_is_deferred_when_retry_after_is_too_long(self):
+        client = WikidataWebsiteDiscovery(batch_size=1)
+        headers = {"Retry-After": "60"}
+        limited = urllib.error.HTTPError("https://query.wikidata.org/sparql", 429, "Too Many Requests", headers, None)
+        with patch.object(client, "_query", side_effect=limited) as query:
+            candidates, report = client.discover([profile("923609016")])
+        self.assertFalse(candidates)
+        self.assertEqual(query.call_count, 1)
+        self.assertEqual(report["requests"], 1)
+        self.assertEqual(report["deferred_organisations"], ["923609016"])
+        self.assertEqual(report["status"], "partial")
 
 
 if __name__ == "__main__":

@@ -77,6 +77,31 @@ class NavJobFeedTests(unittest.TestCase):
             report = NavJobFeed().enrich([row])
         self.assertEqual(report["matched_profiles"], 0)
 
+    def test_exact_name_candidates_get_detail_budget_before_similar_names(self):
+        expiry = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=4)).isoformat()
+        wrong = {"status": "ACTIVE", "ad_content": {"title": "Wrong", "expires": expiry,
+            "employer": {"name": "Example Group", "orgnr": "999999999"}}}
+        exact = {"status": "ACTIVE", "ad_content": {"title": "Right", "expires": expiry,
+            "employer": {"name": "Example AS", "orgnr": "923609016"}}}
+        page = {"items": [
+            {"id": "similar", "url": "/api/v1/feedentry/similar", "_feed_entry": {"uuid": "similar", "status": "ACTIVE", "businessName": "Example Group"}},
+            {"id": "exact", "url": "/api/v1/feedentry/exact", "_feed_entry": {"uuid": "exact", "status": "ACTIVE", "businessName": "Example AS"}},
+        ], "next_url": None}
+        responses = [(b"token\nheader\neyJhbGci.eyJzdWIi.signature", None), (json.dumps(page).encode(), page),
+                     (json.dumps(exact).encode(), exact)]
+        requested = []
+        def get(_self, url, token=None, modified_since=None):
+            requested.append(url)
+            _self.requests += 1
+            return responses.pop(0)
+        row = profile()
+        with patch.object(NavJobFeed, "_get", get):
+            report = NavJobFeed(max_details=1).enrich([row])
+        self.assertTrue(requested[-1].endswith("/exact"))
+        self.assertEqual(report["matched_profiles"], 1)
+        self.assertEqual(report["status"], "partial")
+        self.assertTrue(report["truncated"])
+
     def test_missing_employer_org_number_requires_name_and_location_or_homepage(self):
         expiry = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=4)).isoformat()
         detail = {"status": "ACTIVE", "ad_content": {"title": "Engineer", "expires": expiry,

@@ -824,15 +824,15 @@ class Agent:
             claim("jobs", "failed", reason="Website URL could not be parsed safely")
             claim("public_activity", "failed", reason="Website URL could not be parsed safely")
             return
-        if not safe_url:
-            claim("web_presence", "ambiguous", reason="Registry website URL is not safe HTTPS")
-            claim("jobs", "not_available", reason="Website URL was not crawled")
-            claim("public_activity", "not_available", reason="Website URL was not crawled")
-            return
         if is_directory_host(parsed.hostname or ""):
             claim("web_presence", "ambiguous", reason="Candidate is a third-party business directory, not a company-owned website")
             claim("jobs", "not_available", reason="Directory pages are not treated as the company's careers source")
             claim("public_activity", "not_available", reason="Directory pages are not treated as the company's public-activity source")
+            return
+        if not safe_url:
+            claim("web_presence", "ambiguous", reason="Registry website URL is not safe HTTPS")
+            claim("jobs", "not_available", reason="Website URL was not crawled")
+            claim("public_activity", "not_available", reason="Website URL was not crawled")
             return
         url = urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path or "/", "", "", ""))
         robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
@@ -1556,8 +1556,8 @@ def main() -> int:
     ap.add_argument("--resume", action="store_true", help="Resume completed company fetches from the checkpoint")
     ap.add_argument("--web-search-judge",action="store_true",help="Opt in to one OpenAI web-search call per valid company; results are unverified candidates, never facts")
     ap.add_argument("--nav-jobs",action="store_true",help="Enable a bounded NAV public-job-feed scan over up to six months of active-ad updates")
-    ap.add_argument("--nav-pages",type=int,default=25,help="Maximum NAV feed pages when --nav-jobs is enabled (default: 25; hard cap: 100)")
-    ap.add_argument("--nav-details",type=int,default=100,help="Maximum NAV job details to fetch per batch (default: 100; hard cap: 500)")
+    ap.add_argument("--nav-pages",type=int,default=100,help="Maximum NAV feed pages when --nav-jobs is enabled (default: 100; hard cap: 100)")
+    ap.add_argument("--nav-details",type=int,default=150,help="Maximum NAV job details to fetch per batch (default: 150; hard cap: 500)")
     ap.add_argument("--nav-days",type=int,default=180,help="NAV update lookback in days (default: 180; hard cap: 183)")
     ap.add_argument("--wikidata-websites",action="store_true",help="Discover website candidates via exact Wikidata P2333 matches, then independently verify each site")
     ap.add_argument("--brave-websites",action="store_true",help="After BRREG and Wikidata find no website, use Brave Search for candidate URLs; requires BRAVE_SEARCH_API_KEY and a Brave plan with storage rights")

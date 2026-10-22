@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import email.utils
+import datetime as dt
 import re
 import time
 import urllib.error
@@ -12,7 +14,7 @@ from request_budget import consume_request
 
 
 ENDPOINT = "https://query.wikidata.org/sparql"
-UA = "SignalpostResearchAgent/0.3 (public company website discovery)"
+UA = "SignalpostAgent/0.4 (https://github.com/AnanthKumar1810/signalpost-agent; public company website discovery)"
 BATCH_SIZE = 50
 MAX_RESPONSE_BYTES = 2_000_000
 BLOCKED_HOSTS = {
@@ -64,6 +66,8 @@ class WikidataWebsiteDiscovery:
         self.requests = 0
         self.errors: list[str] = []
         self.failed_organisations: set[str] = set()
+        self.deferred_organisations: set[str] = set()
+        self.retry_count = 0
 
     @staticmethod
     def _has_verified_website(profile: dict[str, Any]) -> bool:
@@ -125,25 +129,58 @@ class WikidataWebsiteDiscovery:
                 deadline_reached = True
                 break
             batch = orgs[offset:offset + self.batch_size]
-            self.requests += 1
-            try:
-                _, rows = self._query(batch)
-            except Exception as exc:
-                self.errors.append(f"batch {offset // self.batch_size + 1}: {type(exc).__name__}: {str(exc)[:200]}")
-                self.failed_organisations.update(batch)
-                continue
+            attempt = 0
+            while True:
+                self.requests += 1
+                try:
+                    _, rows = self._query(batch)
+                    break
+                except urllib.error.HTTPError as exc:
+                    if exc.code != 429 or attempt >= 1:
+                        self.errors.append(f"batch {offset // self.batch_size + 1}: {type(exc).__name__}: {str(exc)[:200]}")
+                        self.failed_organisations.update(batch)
+                        rows = []
+                        break
+                    retry_after = (exc.headers or {}).get("Retry-After", "")
+                    wait_seconds: float | None = None
+                    try:
+                        wait_seconds = max(0.0, float(retry_after))
+                    except (TypeError, ValueError):
+                        try:
+                            retry_at = email.utils.parsedate_to_datetime(str(retry_after))
+                            if retry_at.tzinfo is None:
+                                retry_at = retry_at.replace(tzinfo=dt.timezone.utc)
+                            wait_seconds = max(0.0, (retry_at - dt.datetime.now(dt.timezone.utc)).total_seconds())
+                        except (TypeError, ValueError, OverflowError):
+                            wait_seconds = 1.0
+                    remaining = (deadline - time.monotonic()) if deadline is not None else 5.0
+                    if wait_seconds > min(5.0, max(0.0, remaining)):
+                        self.errors.append(f"batch {offset // self.batch_size + 1}: HTTP 429 retry deferred by Retry-After ({retry_after or 'unspecified'})")
+                        self.deferred_organisations.update(batch)
+                        rows = []
+                        break
+                    time.sleep(wait_seconds)
+                    attempt += 1
+                    self.retry_count += 1
+                except Exception as exc:
+                    self.errors.append(f"batch {offset // self.batch_size + 1}: {type(exc).__name__}: {str(exc)[:200]}")
+                    self.failed_organisations.update(batch)
+                    rows = []
+                    break
             for row in rows:
                 # Stable preference: HTTPS, then normalized hostname and URL.
                 current = candidates.get(row["organisation_number"])
                 if current is None or (row["site"].lower(), row["item"]) < (current["site"].lower(), current["item"]):
                     candidates[row["organisation_number"]] = row
-        status = "partial" if deadline_reached else "complete" if not self.errors else "partial" if candidates else "failed"
+        status = "partial" if deadline_reached or self.deferred_organisations else "complete" if not self.errors else "partial" if candidates else "failed"
         return candidates, {
             "status": status,
             "requests": self.requests,
             "target_count": len(orgs),
             "candidate_count": len(candidates),
             "failed_organisations": sorted(self.failed_organisations),
+            "deferred_organisations": sorted(self.deferred_organisations),
+            "retry_count": self.retry_count,
             "deadline_reached": deadline_reached,
             "errors": self.errors,
             "identity_rule": "Wikidata P2333 exactly equals requested organisation number; P856 is only a candidate, and fetched page still needs independent identity verification.",

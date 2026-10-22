@@ -56,7 +56,7 @@ def _name_is_candidate(feed_name: Any, legal_key: str) -> bool:
 class NavJobFeed:
     """Scan recent NAV feed pages once per batch and verify candidate ad details."""
 
-    def __init__(self, timeout: float = 8, max_pages: int = 25, max_details: int = 100, lookback_days: int = 180):
+    def __init__(self, timeout: float = 8, max_pages: int = 100, max_details: int = 150, lookback_days: int = 180):
         self.timeout = timeout
         self.max_pages = max(1, min(int(max_pages), 100))
         self.max_details = max(1, min(int(max_details), 500))
@@ -157,7 +157,9 @@ class NavJobFeed:
                         possible_orgs = [org for org, target in targets.items()
                                          if _name_is_candidate(key, target["key"])]
                     for org in possible_orgs:
-                        candidates.setdefault(str(header.get("uuid") or item.get("id") or ""), {"org": org, "url": item.get("url"), "header": header})
+                        candidate_id = str(header.get("uuid") or item.get("id") or "")
+                        candidates.setdefault(candidate_id, {"org": org, "url": item.get("url"), "header": header,
+                                                             "exact_name": key == targets[org]["key"]})
                 next_url = page.get("next_url")
                 if not next_url:
                     feed_url = ""
@@ -173,7 +175,11 @@ class NavJobFeed:
             detail_count = 0
             entity_mismatches = 0
             expired_or_undated = 0
-            for candidate in candidates.values():
+            # Use scarce detail calls on exact legal-name candidates first.
+            # Similar-name entries remain leads only and must pass the same
+            # exact org-number or name+location/homepage attribution below.
+            ordered_candidates = sorted(candidates.values(), key=lambda item: not item["exact_name"])
+            for candidate in ordered_candidates:
                 if detail_count >= self.max_details:
                     self.truncated = True
                     break
@@ -249,7 +255,8 @@ class NavJobFeed:
                         existing.pop("reason", None)
                     else:
                         profile.setdefault("claims", []).append({"family": "jobs", "status": "available", "facts": facts})
-            return {"requests": self.requests, "matched_profiles": matched, "status": "complete", "truncated": self.truncated,
+            return {"requests": self.requests, "matched_profiles": matched,
+                    "status": "partial" if self.truncated else "complete", "truncated": self.truncated,
                     "pages_limit": self.max_pages, "detail_limit": self.max_details, "lookback_days": self.lookback_days,
                     "active_feed_entries_seen": active_feed_entries, "candidate_details_queued": len(candidates),
                     "details_fetched": detail_count, "entity_mismatches": entity_mismatches,
