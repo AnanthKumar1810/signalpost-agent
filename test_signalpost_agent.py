@@ -427,6 +427,18 @@ class AgentTests(unittest.TestCase):
         self.assertIn("third-party business directory", website[1]["reason"])
         self.assertEqual(env["operations"]["requests"], 0)
 
+    def test_kvantil_company_profile_is_not_published_as_company_website(self):
+        env = {"operations": {"requests": 0}, "claims": [], "errors": [],
+               "evidence": [], "source_snapshots": [], "changes": []}
+        claims = []
+        self.agent.website("997342992", "https://kvantil.no/company/997342992/concentration",
+                           "CHOKOLADEFABRIKKEN UTBYGGINGSSELSKAP AS", env,
+                           lambda *args, **kwargs: claims.append((args, kwargs)))
+        website = next(call for call in claims if call[0][0] == "web_presence")
+        self.assertEqual(website[0][1], "ambiguous")
+        self.assertIn("third-party business directory", website[1]["reason"])
+        self.assertEqual(env["operations"]["requests"], 0)
+
     def test_search_candidate_needs_same_host_legal_corroboration(self):
         class Headers:
             def __init__(self, content_type): self.content_type = content_type

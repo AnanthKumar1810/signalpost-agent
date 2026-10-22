@@ -5,6 +5,7 @@ import datetime as dt
 import email.utils
 import json
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -108,7 +109,7 @@ class NavJobFeed:
         parsed = urllib.parse.urlparse(value if "://" in value else "https://" + value)
         return (parsed.hostname or "").lower().removeprefix("www.")
 
-    def enrich(self, profiles: list[dict[str, Any]]) -> dict[str, Any]:
+    def enrich(self, profiles: list[dict[str, Any]], deadline: float | None = None) -> dict[str, Any]:
         targets: dict[str, dict[str, Any]] = {}
         by_name: dict[str, list[str]] = defaultdict(list)
         for profile in profiles:
@@ -138,6 +139,9 @@ class NavJobFeed:
             candidates: dict[str, dict[str, Any]] = {}
             active_feed_entries = 0
             for _ in range(self.max_pages):
+                if deadline is not None and time.monotonic() >= deadline:
+                    self.truncated = True
+                    break
                 _raw, page = self._get(feed_url, token, since)
                 if not isinstance(page, dict) or not isinstance(page.get("items"), list):
                     raise ValueError("NAV returned an invalid feed page")
@@ -180,6 +184,9 @@ class NavJobFeed:
             # exact org-number or name+location/homepage attribution below.
             ordered_candidates = sorted(candidates.values(), key=lambda item: not item["exact_name"])
             for candidate in ordered_candidates:
+                if deadline is not None and time.monotonic() >= deadline:
+                    self.truncated = True
+                    break
                 if detail_count >= self.max_details:
                     self.truncated = True
                     break
@@ -258,6 +265,7 @@ class NavJobFeed:
             return {"requests": self.requests, "matched_profiles": matched,
                     "status": "partial" if self.truncated else "complete", "truncated": self.truncated,
                     "pages_limit": self.max_pages, "detail_limit": self.max_details, "lookback_days": self.lookback_days,
+                    "deadline_reached": bool(deadline is not None and time.monotonic() >= deadline),
                     "active_feed_entries_seen": active_feed_entries, "candidate_details_queued": len(candidates),
                     "details_fetched": detail_count, "entity_mismatches": entity_mismatches,
                     "expired_or_undated_details": expired_or_undated}

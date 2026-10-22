@@ -102,6 +102,19 @@ class NavJobFeedTests(unittest.TestCase):
         self.assertEqual(report["status"], "partial")
         self.assertTrue(report["truncated"])
 
+    def test_scan_stops_and_reports_partial_when_batch_deadline_is_reached(self):
+        row = profile()
+        responses = [(b"token\nheader\neyJhbGci.eyJzdWIi.signature", None)]
+        def get(_self, _url, token=None, modified_since=None):
+            _self.requests += 1
+            return responses.pop(0)
+        with patch.object(NavJobFeed, "_get", get):
+            report = NavJobFeed().enrich([row], deadline=0)
+        self.assertEqual(report["status"], "partial")
+        self.assertTrue(report["truncated"])
+        self.assertTrue(report["deadline_reached"])
+        self.assertEqual(report["requests"], 1)
+
     def test_missing_employer_org_number_requires_name_and_location_or_homepage(self):
         expiry = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=4)).isoformat()
         detail = {"status": "ACTIVE", "ad_content": {"title": "Engineer", "expires": expiry,

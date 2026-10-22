@@ -21,7 +21,7 @@ ENDPOINT = "https://api.search.tinyfish.ai"
 API_HOST = "api.search.tinyfish.ai"
 MAX_RESPONSE_BYTES = 2_000_000
 DIRECTORY_HOSTS = {
-    "brreg.no", "virksomhet.brreg.no", "proff.no", "purehelp.no", "1881.no",
+    "brreg.no", "virksomhet.brreg.no", "proff.no", "purehelp.no", "1881.no", "kvantil.no",
     "gulesider.no", "kredittsjekk.no", "firmadatabasen.no", "sokfirma.no",
     "foretaksinfo.no", "foretak.io", "io.no", "yra.no", "vexter.no",
     "tracxn.com", "unrealfund.com", "21st.ai", "byndle.no", "utdanning.no",

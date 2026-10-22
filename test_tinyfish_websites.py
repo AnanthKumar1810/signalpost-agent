@@ -41,6 +41,7 @@ class TinyFishDiscoveryTests(unittest.TestCase):
             {"url": "https://forvalt.no/Nettbutikk/produkter/923609016"},
             {"url": "https://www.1850.no/bedrifter/example"},
             {"url": "https://firmalisten.no/923609016"},
+            {"url": "https://kvantil.no/company/923609016/concentration"},
             {"url": "https://aksjegrafen.com/selskap/923609016"},
             {"url": "https://rosa.no/tlf/example/923609016"},
             {"url": "https://kaspi.kz/shop/p/923609016"},

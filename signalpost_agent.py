@@ -1645,6 +1645,9 @@ def main() -> int:
     n=0
     started_batch=time.monotonic()
     work_deadline = started_batch + args.deadline_seconds - args.finalization_reserve_seconds
+    nav_reserve_seconds = (min(900, max(0, args.deadline_seconds - args.finalization_reserve_seconds - 30))
+                           if args.nav_jobs else 0)
+    source_deadline = work_deadline - nav_reserve_seconds
     def process(org: str) -> dict[str, Any]:
         worker_agent=Agent(args.state,not args.no_website,args.timeout)
         try:
@@ -1779,7 +1782,7 @@ def main() -> int:
         candidate_count = verified_count = searched = 0
         deadline_limited = False
         for index, original in enumerate(results):
-            if time.monotonic() >= work_deadline:
+            if time.monotonic() >= source_deadline:
                 deadline_limited = True
                 break
             org = str(original.get("organisation_number") or "")
@@ -1859,7 +1862,7 @@ def main() -> int:
         candidate_count = verified_count = searched = budget_exhausted_targets = 0
         deadline_limited = False
         for index, original in enumerate(results):
-            if time.monotonic() >= work_deadline:
+            if time.monotonic() >= source_deadline:
                 deadline_limited = True
                 break
             org = str(original.get("organisation_number") or "")
@@ -1923,7 +1926,7 @@ def main() -> int:
         searched = 0
         deadline_limited = False
         for index, original in enumerate(results):
-            if time.monotonic() >= work_deadline:
+            if time.monotonic() >= source_deadline:
                 deadline_limited = True
                 break
             org = str(original.get("organisation_number") or "")
@@ -2005,7 +2008,8 @@ def main() -> int:
     nav_report = {"status": "disabled", "requests": 0, "matched_profiles": 0}
     if args.nav_jobs and results and time.monotonic() < work_deadline:
         nav_client = NavJobFeed(timeout=args.timeout, max_pages=args.nav_pages, max_details=args.nav_details, lookback_days=args.nav_days)
-        nav_report = nav_client.enrich(results)
+        nav_report = nav_client.enrich(results, deadline=work_deadline)
+        nav_report["reserved_seconds"] = nav_reserve_seconds
         # NAV is a batch-level shared source. Attribute its shared request cost
         # once, and count per-ad requests on the matching company profile.
         if results:
@@ -2098,7 +2102,7 @@ def main() -> int:
                    "provider-published free tier; billing not independently verified" if tinyfish_report.get("requests", 0) else
                    "no paid provider calls")
     request_budget = request_budget_stats()
-    report={"input_count":len(orgs),"output_count":n,"unique_input_count":len(set(orgs)),"all_inputs_have_terminal_result":n==len(orgs),"identity_status_counts":states,"family_status_counts":families,"requests":request_budget["used"],"profile_reported_requests":profile_reported_requests,"outbound_request_budget":request_budget,"batch_deadline":{"seconds":args.deadline_seconds,"finalization_reserve_seconds":args.finalization_reserve_seconds,"reached":deadline_hit},"checkpoint":{"path":str(checkpoint_path),"resumed_profiles":resumed_profiles},"claim_judge":{"status":"excluded_from_competition_pipeline","reason":"Search results are not integrated as scored evidence-backed claims; the option is rejected to avoid candidate-only output being mistaken for published facts"},"nav_job_feed":nav_report,"wikidata_website_discovery":wikidata_report,"tinyfish_website_discovery":tinyfish_report,"tavily_website_discovery":tavily_report,"brave_website_discovery":brave_report,"llm_summary":llm_summary_report,"runtime_ms_sum":runtime,"wall_runtime_ms":int((time.monotonic()-started_batch)*1000),"workers":args.workers,"errors":errors,"third_party_cost_usd":round(costs,6) if cost_known else None,"third_party_cost_estimate_usd":round(estimate_total,8),"third_party_cost_status":cost_status,"cost_basis":"TinyFish and Tavily usage must be checked against provider free-credit allowances; optional OpenAI and Brave costs are estimates from published rates and response usage, not billing records","output":str(args.output),"dashboard":str(dashboard)}
+    report={"input_count":len(orgs),"output_count":n,"unique_input_count":len(set(orgs)),"all_inputs_have_terminal_result":n==len(orgs),"identity_status_counts":states,"family_status_counts":families,"requests":request_budget["used"],"profile_reported_requests":profile_reported_requests,"outbound_request_budget":request_budget,"batch_deadline":{"seconds":args.deadline_seconds,"finalization_reserve_seconds":args.finalization_reserve_seconds,"nav_reserve_seconds":nav_reserve_seconds,"reached":deadline_hit},"checkpoint":{"path":str(checkpoint_path),"resumed_profiles":resumed_profiles},"claim_judge":{"status":"excluded_from_competition_pipeline","reason":"Search results are not integrated as scored evidence-backed claims; the option is rejected to avoid candidate-only output being mistaken for published facts"},"nav_job_feed":nav_report,"wikidata_website_discovery":wikidata_report,"tinyfish_website_discovery":tinyfish_report,"tavily_website_discovery":tavily_report,"brave_website_discovery":brave_report,"llm_summary":llm_summary_report,"runtime_ms_sum":runtime,"wall_runtime_ms":int((time.monotonic()-started_batch)*1000),"workers":args.workers,"errors":errors,"third_party_cost_usd":round(costs,6) if cost_known else None,"third_party_cost_estimate_usd":round(estimate_total,8),"third_party_cost_status":cost_status,"cost_basis":"TinyFish and Tavily usage must be checked against provider free-credit allowances; optional OpenAI and Brave costs are estimates from published rates and response usage, not billing records","output":str(args.output),"dashboard":str(dashboard)}
     args.output.with_suffix(args.output.suffix+".report.json").write_text(json.dumps(report,indent=2,ensure_ascii=False)+"\n",encoding="utf-8")
     print(json.dumps(report,ensure_ascii=False))
     deactivate_request_budget()
