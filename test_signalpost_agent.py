@@ -453,6 +453,35 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(website[0][1], "ambiguous")
         self.assertIn("same-host legal/contact evidence", website[1]["reason"])
 
+    def test_brreg_listed_site_accepts_exact_legal_name_without_form_suffix(self):
+        class Headers:
+            def get_content_type(self): return "text/html"
+        class Response:
+            headers = Headers()
+            def __init__(self, url, body): self.url, self.body = url, body
+            def __enter__(self): return self
+            def __exit__(self, *_args): return False
+            def geturl(self): return self.url
+            def read(self, _limit): return self.body
+        responses = [
+            Response("https://arenatrondheim.no/robots.txt", b"User-agent: *\nAllow: /\n"),
+            Response("https://arenatrondheim.no/", b"<title>Arena Trondheim</title><h1>Arena Trondheim</h1><p>Aktiviteter for alle.</p>"),
+        ]
+        env = {"operations": {"requests": 0}, "source_snapshots": [], "evidence": [], "errors": [], "changes": []}
+        claims = []
+        with patch.object(sp, "public_host", return_value=True), patch.object(sp, "open_safe", side_effect=responses):
+            self.agent.website("992120193", "https://arenatrondheim.no/", "ARENA TRONDHEIM AS", env,
+                               lambda family, status, facts=None, reason=None: claims.append({"family": family, "status": status, "facts": facts or [], "reason": reason}))
+        website = next(item for item in claims if item["family"] == "web_presence")
+        self.assertEqual(website["status"], "available")
+        self.assertEqual(website["facts"][0]["value"], "https://arenatrondheim.no/")
+
+    def test_registered_suffix_free_name_does_not_relax_search_candidates(self):
+        self.assertTrue(sp.registered_name_base_matches_page(
+            "ARENA TRONDHEIM AS", "Arena Trondheim hosts events.", "Arena Trondheim"))
+        self.assertFalse(sp.legal_name_matches_page(
+            "ARENA TRONDHEIM AS", "Arena Trondheim hosts events.", "Arena Trondheim"))
+
     def test_safe_website_requires_exact_legal_name_or_org_number(self):
         parser = sp.PageParser("https://example.no/")
         parser.feed("<title>Company</title><body>Example AS offers software.</body>")

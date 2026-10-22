@@ -153,6 +153,34 @@ def legal_name_matches_page(legal_name: str, page_text: str, identity_heading: s
     return False
 
 
+def registered_name_base_matches_page(legal_name: str, page_text: str, identity_heading: str = "") -> bool:
+    """Match the exact legal-name words without the legal-form suffix.
+
+    This weaker form is accepted only for a website URL obtained directly from
+    BRREG's record for this organisation. Search-engine candidates still need
+    the full legal name or an explicitly labelled organisation number plus
+    same-host legal/contact corroboration.
+    """
+    tokens = _normalized_name_tokens(legal_name)
+    if tokens and tokens[-1] in _LEGAL_FORM_SUFFIXES:
+        tokens = tokens[:-1]
+    if not tokens:
+        return False
+    page_tokens = _normalized_name_tokens(page_text)
+    heading_tokens = _normalized_name_tokens(identity_heading)
+    def contains(sequence: list[str], phrase: list[str]) -> bool:
+        width = len(phrase)
+        return width <= len(sequence) and any(
+            sequence[index:index + width] == phrase
+            for index in range(len(sequence) - width + 1)
+        )
+    # A one-word base is vulnerable to incidental mentions in body copy, so
+    # require it to be the exact title/H1 token sequence.
+    if len(tokens) == 1:
+        return heading_tokens == tokens
+    return contains(heading_tokens, tokens) or contains(page_tokens, tokens)
+
+
 def page_has_organisation_number(page_text: str, organisation_number: str) -> bool:
     """Recognize the exact number only when the page labels it as a company ID."""
     expected = normalize_org(organisation_number)
@@ -868,8 +896,15 @@ class Agent:
             identity_heading = " ".join(p.title + p.h1)
             name_match = legal_name_matches_page(legal_name, page_text, identity_heading)
             org_match = page_has_organisation_number(page_text, org)
+            # BRREG's own homepage field is an independent domain-to-entity
+            # link. On that path, an exact legal-name base without AS/ASA is
+            # enough to recognize the site branding (for example, “Arena
+            # Trondheim” for “ARENA TRONDHEIM AS”). Open-web candidates do
+            # not receive this allowance.
+            registered_base_match = (not require_domain_name_match and
+                                     registered_name_base_matches_page(legal_name, page_text, identity_heading))
             identity_support_ids: list[str] = []
-            if require_domain_name_match or not (name_match or org_match):
+            if require_domain_name_match or not (name_match or org_match or registered_base_match):
                 legal_links = []
                 for href, caption in p.links:
                     full = urllib.parse.urlparse(href)
@@ -922,7 +957,8 @@ class Agent:
             # identity/legal page. The homepage may be a marketplace listing,
             # an article that mentions the company, or a product code containing
             # the organisation number.
-            identity_verified = bool(identity_support_ids) if require_domain_name_match else (name_match or org_match)
+            identity_verified = (bool(identity_support_ids) if require_domain_name_match
+                                 else (name_match or org_match or registered_base_match))
             if identity_verified:
                 facts=[{"field":"website_url","value":url,"evidence_ids":[snap["id"], *identity_support_ids],"observed_at":snap["retrieved_at"],"valid_at":None},
                        {"field":"website_title","value":title or urllib.parse.urlparse(url).hostname,"evidence_ids":[snap["id"]],"observed_at":snap["retrieved_at"],"valid_at":None}]
