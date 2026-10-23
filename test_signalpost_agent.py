@@ -158,7 +158,7 @@ class AgentTests(unittest.TestCase):
         self.assertNotIn("</script><script>bad()", page)
 
     def test_official_registry_maps_facts_and_evidence(self):
-        data = {"organisasjonsnummer": "923609016", "navn": "Eksempel AS", "organisasjonsform": {"kode": "AS"}, "registreringsdatoEnhetsregisteret": "2010-01-01", "naeringskode1": {"kode": "62.010", "beskrivelse": "Programming"}, "antallAnsatte": 12, "hjemmeside": "https://example.no", "forretningsadresse": {"kommune": "Oslo", "postnummer": "0001", "poststed": "Oslo", "adresse": ["Gate 1"]}, "sisteInnsendteAarsregnskap": {"aar": 2025}}
+        data = {"organisasjonsnummer": "923609016", "navn": "Eksempel AS", "organisasjonsform": {"kode": "AS"}, "registreringsdatoEnhetsregisteret": "2010-01-01", "naeringskode1": {"kode": "62.010", "beskrivelse": "Programming"}, "aktivitet": ["Software development", "and support"], "antallAnsatte": 12, "hjemmeside": "https://example.no", "forretningsadresse": {"kommune": "Oslo", "postnummer": "0001", "poststed": "Oslo", "adresse": ["Gate 1"]}, "sisteInnsendteAarsregnskap": {"aar": 2025}}
         roles = {"rollegrupper": [{"roller": [{"type": {"beskrivelse": "Daglig leder"}, "person": {"navn": {"fornavn": "Ada", "etternavn": "Nord"}}}]}]}
         annual = {"_embedded": {"regnskap": [{"virksomhet": {"organisasjonsnummer": "923609016"}, "valuta": "NOK", "regnskapsperiode": {"fraDato": "2024-01-01", "tilDato": "2024-12-31"}, "resultatregnskapResultat": {"aarsresultat": 125000, "driftsresultat": {"driftsresultat": 150000, "driftsinntekter": {"sumDriftsinntekter": 750000}}}, "eiendeler": {"sumEiendeler": 500000}, "egenkapitalGjeld": {"egenkapital": {"sumEgenkapital": 325000}}}]}}
         with patch.object(sp, "get_json", side_effect=[(data, json.dumps(data).encode(), 200), (roles, json.dumps(roles).encode(), 200), (annual, json.dumps(annual).encode(), 200)]):
@@ -176,6 +176,8 @@ class AgentTests(unittest.TestCase):
         self.assertEqual({c["family"] for c in result["claims"]}, set(sp.FAMILIES))
         self.assertIn("Eksempel AS", result["summary"]["text"])
         self.assertIn("registered activity as Programming", result["summary"]["text"])
+        self.assertIn("declared activity as Software development and support", result["summary"]["text"])
+        self.assertIn(("declared_activity", "Software development and support"), [(fact["field"], fact["value"]) for fact in next(c for c in result["claims"] if c["family"] == "company_details")["facts"]])
         self.assertIn("12 registered employees", result["summary"]["text"])
         self.assertIn("revenue NOK 750,000", result["summary"]["text"])
         self.assertIn("net result NOK 125,000", result["summary"]["text"])

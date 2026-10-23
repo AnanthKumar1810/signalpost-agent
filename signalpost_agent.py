@@ -659,7 +659,12 @@ class Agent:
         address = data.get("forretningsadresse")
         address = address if isinstance(address, dict) else {}
         env["identity_anchor"] = {"organisation_number": org, "legal_name": name, "organisation_form": organisation_form.get("kode"), "registry_url": url, "evidence_id": snap["id"], "status": "verified"}
-        registry_fields = {"legal_name": name, "organisation_form": organisation_form.get("kode"), "registered_at": data.get("registreringsdatoEnhetsregisteret"), "industry_code": industry.get("kode"), "industry_description": industry.get("beskrivelse"), "employee_count": data.get("antallAnsatte"), "website": data.get("hjemmeside"), "municipality": address.get("kommune"), "postal_code": address.get("postnummer"), "city": address.get("poststed"), "address": address or None}
+        declared_activity = data.get("aktivitet")
+        if isinstance(declared_activity, list):
+            declared_activity = " ".join(part.strip() for part in declared_activity if isinstance(part, str) and part.strip())
+        if not isinstance(declared_activity, str) or not declared_activity.strip():
+            declared_activity = None
+        registry_fields = {"legal_name": name, "organisation_form": organisation_form.get("kode"), "registered_at": data.get("registreringsdatoEnhetsregisteret"), "industry_code": industry.get("kode"), "industry_description": industry.get("beskrivelse"), "declared_activity": declared_activity, "employee_count": data.get("antallAnsatte"), "website": data.get("hjemmeside"), "municipality": address.get("kommune"), "postal_code": address.get("postnummer"), "city": address.get("poststed"), "address": address or None}
         # These status/date fields are documented in BRREG's Enhetsregisteret v2 entity response.
         # Emit positive statuses only; absence or false is not a noteworthy event.
         status_fields = {
@@ -1354,6 +1359,7 @@ class Agent:
         fields = {fact.get("field"): fact for fact in details}
         name = anchor.get("legal_name") or env.get("organisation_number") or "Company"
         industry = fields.get("industry_description", {}).get("value")
+        declared_activity = fields.get("declared_activity", {}).get("value")
         form = anchor.get("organisation_form")
         city = fields.get("city", {}).get("value")
         clauses = [f"{name} is registered in Norway" + (f" as {form}" if form else "") + "."]
@@ -1365,6 +1371,8 @@ class Agent:
             cite(fact)
         if industry:
             clauses.append(f"BRREG classifies its registered activity as {industry}.")
+        if declared_activity:
+            clauses.append(f"BRREG records its declared activity as {declared_activity}.")
         if city:
             clauses.append(f"Its registered business location is {city}.")
         employees = fields.get("employee_count")

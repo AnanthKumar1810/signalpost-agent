@@ -2,6 +2,8 @@
 
 This is a runnable, evidence-first baseline for researching Norwegian companies by organisation number. It anchors each profile in the Brønnøysund Register Centre (BRREG), records source snapshots and retrieval times, and returns one JSONL envelope per input. A failed or blocked source is reported explicitly; the agent never turns missing data into zero.
 
+The BRREG profile now includes the register's declared `aktivitet` text when present, separately from its industry classification. The summary identifies it as a registry-recorded declaration and links it to the same official source snapshot. This addition was prompted by a review of [Karthik's MIT-licensed reference implementation](https://github.com/JatothKarthikKumar/signalpost-company-research-agent); no source code was copied. Its old NAV `public-feed` lookup is not used: NAV says that API was retired in 2025 and its replacement requires employer filtering on the consumer side. See [NAV's feed documentation](https://navikt.github.io/pam-stilling-feed/).
+
 ## Run it
 
 Requires Python 3.10 or newer. The program uses only the Python standard library and makes no paid model or search API calls.
