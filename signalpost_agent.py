@@ -89,6 +89,16 @@ def has_verified_website(profile: dict[str, Any]) -> bool:
                for claim in profile.get("claims", []) if isinstance(claim, dict))
 
 
+def note_unverified_candidates(profile: dict[str, Any], provider: str,
+                               ambiguous: bool, blocked: bool) -> None:
+    """Record failed discovery without erasing an earlier registry-site assessment."""
+    if not ambiguous and not blocked:
+        profile.setdefault("errors", []).append({
+            "type": f"{provider}_candidate_verification_failed",
+            "message": "Candidate pages could not be safely verified; no candidate facts were published",
+        })
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
@@ -1602,6 +1612,13 @@ def make_dashboard(jsonl_path: Path) -> Path:
     return destination
 
 
+def phase_reserves(collection_seconds: int, nav_enabled: bool, summary_enabled: bool) -> tuple[int, int]:
+    """Keep optional late phases runnable without starving discovery on short batches."""
+    nav_seconds = min(900, int(collection_seconds * 0.20)) if nav_enabled else 0
+    summary_seconds = min(180, int(collection_seconds * 0.10)) if summary_enabled else 0
+    return nav_seconds, summary_seconds
+
+
 def main() -> int:
     ap=argparse.ArgumentParser(description="Evidence-first Norwegian company research")
     ap.add_argument("--input",required=True,type=Path)
@@ -1612,7 +1629,7 @@ def main() -> int:
     ap.add_argument("--workers",type=int,default=4,help="Concurrent company lookups (default: 4)")
     ap.add_argument("--deadline-seconds", type=int, default=2400, help="Batch collection deadline in seconds (default: 2400)")
     ap.add_argument("--finalization-reserve-seconds", type=int, default=120, help="Reserve this much time to finish outputs and dashboard (default: 120)")
-    ap.add_argument("--max-outbound-requests", type=int, default=2000, help="Run-wide outbound HTTP request cap (default: 2000; competition maximum: 2000)")
+    ap.add_argument("--max-outbound-requests", type=int, default=2000, help="Run-wide outbound HTTP request cap (default and current CLI maximum: 2000; confirm the official evaluator limit)")
     ap.add_argument("--checkpoint", type=Path, help="JSONL checkpoint path (defaults beside the output)")
     ap.add_argument("--resume", action="store_true", help="Resume completed company fetches from the checkpoint")
     ap.add_argument("--web-search-judge",action="store_true",help="Opt in to one OpenAI web-search call per valid company; results are unverified candidates, never facts")
@@ -1706,9 +1723,13 @@ def main() -> int:
     n=0
     started_batch=time.monotonic()
     work_deadline = started_batch + args.deadline_seconds - args.finalization_reserve_seconds
-    nav_reserve_seconds = (min(900, max(0, args.deadline_seconds - args.finalization_reserve_seconds - 30))
-                           if args.nav_jobs else 0)
-    source_deadline = work_deadline - nav_reserve_seconds
+    collection_seconds = args.deadline_seconds - args.finalization_reserve_seconds
+    # Reserve a share of the *actual* collection window. The old rule reserved
+    # all but 30 seconds for NAV on short runs, preventing website discovery.
+    nav_reserve_seconds, summary_reserve_seconds = phase_reserves(
+        collection_seconds, args.nav_jobs, summary_agent is not None)
+    source_deadline = work_deadline - nav_reserve_seconds - summary_reserve_seconds
+    nav_deadline = work_deadline - summary_reserve_seconds
     def process(org: str) -> dict[str, Any]:
         worker_agent=Agent(args.state,not args.no_website,args.timeout)
         try:
@@ -1789,9 +1810,9 @@ def main() -> int:
                 "run": {"id": str(uuid.uuid4()), "started_at": now(), "finished_at": now(), "status": "complete"},
                 "operations": {"requests": 0, "runtime_ms": 0, "third_party_cost_usd": 0.0}}
     wikidata_report = {"status": "disabled", "requests": 0, "target_count": 0, "candidate_count": 0, "errors": []}
-    if args.wikidata_websites and results and time.monotonic() < work_deadline:
+    if args.wikidata_websites and results and time.monotonic() < source_deadline:
         discovery = WikidataWebsiteDiscovery(timeout=min(args.timeout, 8))
-        candidates, wikidata_report = discovery.discover(results, deadline=work_deadline)
+        candidates, wikidata_report = discovery.discover(results, deadline=source_deadline)
         results[0].setdefault("operations", {}).setdefault("shared_requests", 0)
         results[0]["operations"]["shared_requests"] += wikidata_report.get("requests", 0)
         # Apply only candidates whose Wikidata entity has the exact requested
@@ -1896,15 +1917,7 @@ def main() -> int:
                 prior_runtime = target.get("operations", {}).get("runtime_ms", 0)
                 agent.finish(target, time.monotonic() - prior_runtime / 1000)
             elif search_result.get("candidate_urls"):
-                for item in target.get("claims", []):
-                    if item.get("family") == "web_presence":
-                        item["status"] = "not_available"
-                        item["reason"] = "TinyFish returned candidate pages, but none passed company-ownership and exact-entity verification"
-                    elif item.get("family") in {"jobs", "public_activity"}:
-                        item["status"] = "not_available"
-                        item["reason"] = "No verified company website was available for this lookup"
-                if not ambiguous_candidate and not blocked_candidate:
-                    target.setdefault("errors", []).append({"type": "tinyfish_candidate_verification_failed", "message": "Candidate pages could not be safely verified; no candidate facts were published"})
+                note_unverified_candidates(target, "tinyfish", ambiguous_candidate, blocked_candidate)
                 prior_runtime = target.get("operations", {}).get("runtime_ms", 0)
                 agent.finish(target, time.monotonic() - prior_runtime / 1000)
             results[index] = target
@@ -1957,16 +1970,7 @@ def main() -> int:
                 prior_runtime = target.get("operations", {}).get("runtime_ms", 0)
                 agent.finish(target, time.monotonic() - prior_runtime / 1000)
             elif search_result.get("candidate_urls"):
-                for item in target.get("claims", []):
-                    if item.get("family") == "web_presence":
-                        item["status"] = "not_available"
-                        item["reason"] = "Tavily returned candidate pages, but none passed company-ownership and exact-entity verification"
-                    elif item.get("family") in {"jobs", "public_activity"}:
-                        item["status"] = "not_available"
-                        item["reason"] = "No verified company website was available for this lookup"
-                if not ambiguous_candidate and not blocked_candidate:
-                    target.setdefault("errors", []).append({"type": "tavily_candidate_verification_failed",
-                        "message": "Candidate pages could not be safely verified; no candidate facts were published"})
+                note_unverified_candidates(target, "tavily", ambiguous_candidate, blocked_candidate)
                 prior_runtime = target.get("operations", {}).get("runtime_ms", 0)
                 agent.finish(target, time.monotonic() - prior_runtime / 1000)
             results[index] = target
@@ -2044,16 +2048,7 @@ def main() -> int:
                 agent.finish(target, time.monotonic() - prior_runtime / 1000)
                 results[index] = target
             elif search_result.get("candidate_urls"):
-                for item in target.get("claims", []):
-                    if item.get("family") == "web_presence":
-                        item["status"] = "not_available"
-                        item["reason"] = "Brave returned candidate pages, but none passed company-ownership and exact-entity verification"
-                    elif item.get("family") in {"jobs", "public_activity"}:
-                        item["status"] = "not_available"
-                        item["reason"] = "No verified company website was available for this lookup"
-                if not ambiguous_candidate:
-                    if not blocked_candidate:
-                        target.setdefault("errors", []).append({"type": "brave_candidate_verification_failed", "message": "Candidate pages could not be safely verified; no candidate facts were published"})
+                note_unverified_candidates(target, "brave", ambiguous_candidate, blocked_candidate)
                 prior_runtime = target.get("operations", {}).get("runtime_ms", 0)
                 agent.finish(target, time.monotonic() - prior_runtime / 1000)
             if verified_trial is None:
@@ -2067,9 +2062,9 @@ def main() -> int:
     elif brave and results:
         brave_report["status"] = "deadline_deferred"
     nav_report = {"status": "disabled", "requests": 0, "matched_profiles": 0}
-    if args.nav_jobs and results and time.monotonic() < work_deadline:
+    if args.nav_jobs and results and time.monotonic() < nav_deadline:
         nav_client = NavJobFeed(timeout=args.timeout, max_pages=args.nav_pages, max_details=args.nav_details, lookback_days=args.nav_days)
-        nav_report = nav_client.enrich(results, deadline=work_deadline)
+        nav_report = nav_client.enrich(results, deadline=nav_deadline)
         nav_report["reserved_seconds"] = nav_reserve_seconds
         # NAV is a batch-level shared source. Attribute its shared request cost
         # once, and count per-ad requests on the matching company profile.
@@ -2163,7 +2158,7 @@ def main() -> int:
                    "provider-published free tier; billing not independently verified" if tinyfish_report.get("requests", 0) else
                    "no paid provider calls")
     request_budget = request_budget_stats()
-    report={"input_count":len(orgs),"output_count":n,"unique_input_count":len(set(orgs)),"all_inputs_have_terminal_result":n==len(orgs),"identity_status_counts":states,"family_status_counts":families,"requests":request_budget["used"],"profile_reported_requests":profile_reported_requests,"outbound_request_budget":request_budget,"batch_deadline":{"seconds":args.deadline_seconds,"finalization_reserve_seconds":args.finalization_reserve_seconds,"nav_reserve_seconds":nav_reserve_seconds,"reached":deadline_hit},"checkpoint":{"path":str(checkpoint_path),"resumed_profiles":resumed_profiles},"claim_judge":{"status":"excluded_from_competition_pipeline","reason":"Search results are not integrated as scored evidence-backed claims; the option is rejected to avoid candidate-only output being mistaken for published facts"},"nav_job_feed":nav_report,"wikidata_website_discovery":wikidata_report,"tinyfish_website_discovery":tinyfish_report,"tavily_website_discovery":tavily_report,"brave_website_discovery":brave_report,"llm_summary":llm_summary_report,"runtime_ms_sum":runtime,"wall_runtime_ms":int((time.monotonic()-started_batch)*1000),"workers":args.workers,"errors":errors,"third_party_cost_usd":round(costs,6) if cost_known else None,"third_party_cost_estimate_usd":round(estimate_total,8),"third_party_cost_status":cost_status,"cost_basis":"TinyFish and Tavily usage must be checked against provider free-credit allowances; optional OpenAI and Brave costs are estimates from published rates and response usage, not billing records","output":str(args.output),"dashboard":str(dashboard)}
+    report={"input_count":len(orgs),"output_count":n,"unique_input_count":len(set(orgs)),"all_inputs_have_terminal_result":n==len(orgs),"identity_status_counts":states,"family_status_counts":families,"requests":request_budget["used"],"profile_reported_requests":profile_reported_requests,"outbound_request_budget":request_budget,"batch_deadline":{"seconds":args.deadline_seconds,"finalization_reserve_seconds":args.finalization_reserve_seconds,"nav_reserve_seconds":nav_reserve_seconds,"summary_reserve_seconds":summary_reserve_seconds,"reached":deadline_hit},"checkpoint":{"path":str(checkpoint_path),"resumed_profiles":resumed_profiles},"claim_judge":{"status":"excluded_from_competition_pipeline","reason":"Search results are not integrated as scored evidence-backed claims; the option is rejected to avoid candidate-only output being mistaken for published facts"},"nav_job_feed":nav_report,"wikidata_website_discovery":wikidata_report,"tinyfish_website_discovery":tinyfish_report,"tavily_website_discovery":tavily_report,"brave_website_discovery":brave_report,"llm_summary":llm_summary_report,"runtime_ms_sum":runtime,"wall_runtime_ms":int((time.monotonic()-started_batch)*1000),"workers":args.workers,"errors":errors,"third_party_cost_usd":round(costs,6) if cost_known else None,"third_party_cost_estimate_usd":round(estimate_total,8),"third_party_cost_status":cost_status,"cost_basis":"TinyFish and Tavily usage must be checked against provider free-credit allowances; optional OpenAI and Brave costs are estimates from published rates and response usage, not billing records","output":str(args.output),"dashboard":str(dashboard)}
     args.output.with_suffix(args.output.suffix+".report.json").write_text(json.dumps(report,indent=2,ensure_ascii=False)+"\n",encoding="utf-8")
     print(json.dumps(report,ensure_ascii=False))
     deactivate_request_budget()

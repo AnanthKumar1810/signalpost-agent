@@ -10,7 +10,30 @@ from unittest.mock import patch
 import signalpost_agent as sp
 
 
+class PhaseSchedulingTests(unittest.TestCase):
+    def test_short_live_pilot_keeps_time_for_website_discovery(self):
+        # A 12-minute batch with a 30-second finalization reserve previously
+        # left just 30 seconds for all non-NAV sources.
+        nav, summary = sp.phase_reserves(690, nav_enabled=True, summary_enabled=False)
+        self.assertGreaterEqual(690 - nav - summary, 500)
+        self.assertGreaterEqual(nav, 100)
+
+    def test_summary_and_nav_each_keep_a_bounded_share(self):
+        nav, summary = sp.phase_reserves(2280, nav_enabled=True, summary_enabled=True)
+        self.assertGreater(2280 - nav - summary, nav + summary)
+        self.assertGreater(summary, 0)
+
+
 class CandidateVerificationIntegrationTests(unittest.TestCase):
+    def test_unverified_search_does_not_erase_ambiguous_registered_site(self):
+        profile = {"claims": [{"family": "web_presence", "status": "ambiguous",
+                               "facts": [], "reason": "Registered page lacks legal-entity evidence"}],
+                   "errors": []}
+        sp.note_unverified_candidates(profile, "tavily", ambiguous=False, blocked=False)
+        self.assertEqual(profile["claims"][0]["status"], "ambiguous")
+        self.assertIn("Registered page", profile["claims"][0]["reason"])
+        self.assertEqual(profile["errors"][0]["type"], "tavily_candidate_verification_failed")
+
     def test_verified_discovery_returns_the_enriched_profile_for_output(self):
         class FakeAgent:
             def website(self, org, url, legal_name, profile, add_claim, require_domain_name_match=False):
