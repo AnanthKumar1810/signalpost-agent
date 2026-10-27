@@ -664,7 +664,54 @@ class Agent:
             declared_activity = " ".join(part.strip() for part in declared_activity if isinstance(part, str) and part.strip())
         if not isinstance(declared_activity, str) or not declared_activity.strip():
             declared_activity = None
-        registry_fields = {"legal_name": name, "organisation_form": organisation_form.get("kode"), "registered_at": data.get("registreringsdatoEnhetsregisteret"), "industry_code": industry.get("kode"), "industry_description": industry.get("beskrivelse"), "declared_activity": declared_activity, "employee_count": data.get("antallAnsatte"), "website": data.get("hjemmeside"), "municipality": address.get("kommune"), "postal_code": address.get("postnummer"), "city": address.get("poststed"), "address": address or None}
+        stated_purpose = data.get("vedtektsfestetFormaal")
+        if isinstance(stated_purpose, list):
+            stated_purpose = " ".join(part.strip() for part in stated_purpose if isinstance(part, str) and part.strip())
+        if not isinstance(stated_purpose, str) or not stated_purpose.strip():
+            stated_purpose = None
+        sector = data.get("institusjonellSektorkode")
+        sector = sector if isinstance(sector, dict) else {}
+        capital = data.get("kapital")
+        capital = capital if isinstance(capital, dict) else {}
+        mailing_address = data.get("postadresse")
+        mailing_address = mailing_address if isinstance(mailing_address, dict) else {}
+        registry_fields = {
+            "legal_name": name,
+            "organisation_form": organisation_form.get("kode"),
+            "organisation_form_description": organisation_form.get("beskrivelse"),
+            "registered_at": _iso_date(data.get("registreringsdatoEnhetsregisteret")),
+            "incorporated_at": _iso_date(data.get("stiftelsesdato")),
+            "business_register_date": _iso_date(data.get("registreringsdatoForetaksregisteret")),
+            "industry_code": industry.get("kode"),
+            "industry_description": industry.get("beskrivelse"),
+            "institutional_sector_code": sector.get("kode"),
+            "institutional_sector_description": sector.get("beskrivelse"),
+            "declared_activity": declared_activity,
+            "stated_purpose": stated_purpose,
+            "employee_count": data.get("antallAnsatte"),
+            "website": data.get("hjemmeside"),
+            "contact_email": data.get("epostadresse"),
+            "contact_phone": data.get("telefon"),
+            "contact_mobile": data.get("mobil"),
+            "municipality": address.get("kommune"),
+            "postal_code": address.get("postnummer"),
+            "city": address.get("poststed"),
+            "address": address or None,
+            "mailing_address": mailing_address or None,
+        }
+        if isinstance(data.get("registrertIMvaregisteret"), bool):
+            registry_fields["vat_registered"] = data["registrertIMvaregisteret"]
+        latest_submitted_year = data.get("sisteInnsendteAarsregnskap")
+        if isinstance(latest_submitted_year, str) and re.fullmatch(r"20[0-9]{2}", latest_submitted_year):
+            registry_fields["latest_submitted_accounts_year"] = latest_submitted_year
+        amount = capital.get("belop")
+        if (capital.get("type") == "Aksjekapital" and capital.get("valuta") == "NOK"
+                and isinstance(amount, (int, float)) and not isinstance(amount, bool)
+                and math.isfinite(amount) and amount >= 0):
+            registry_fields["share_capital_nok"] = amount
+            share_count = capital.get("antallAksjer")
+            if isinstance(share_count, int) and not isinstance(share_count, bool) and share_count >= 0:
+                registry_fields["share_count"] = share_count
         # These status/date fields are documented in BRREG's Enhetsregisteret v2 entity response.
         # Emit positive statuses only; absence or false is not a noteworthy event.
         status_fields = {
@@ -682,10 +729,16 @@ class Agent:
                         date_field = f"{output_field}_date"
                         registry_fields[date_field] = status_date
                         status_date_values[date_field] = status_date
-        facts = [{"field": k, "value": v, "evidence_ids": [snap["id"]], "observed_at": snap["retrieved_at"], "valid_at": (_iso_date(data.get("registreringsdatoEnhetsregisteret")) if k == "registered_at" else status_date_values.get(k))} for k,v in registry_fields.items() if v not in (None, "", {})]
+        date_fields = {"registered_at", "incorporated_at", "business_register_date"}
+        capital_date = _iso_date(capital.get("innfortDato"))
+        facts = [{"field": k, "value": v, "evidence_ids": [snap["id"]], "observed_at": snap["retrieved_at"],
+                  "valid_at": (v if k in date_fields else capital_date if k in {"share_capital_nok", "share_count"}
+                               else status_date_values.get(k))}
+                 for k,v in registry_fields.items() if v not in (None, "", {})]
         env["evidence"].append({"id": snap["id"], "source_id": snap["id"], "excerpt": "; ".join(f"{f['field']}={f['value']}" for f in facts)[:1000], "claim_fields": [f["field"] for f in facts]})
         claim("company_details", "available" if facts else "not_available", facts)
-        claim("locations", "available" if registry_fields["address"] else "not_available", [f for f in facts if f["field"] in {"address", "municipality", "postal_code", "city"}])
+        location_facts = [f for f in facts if f["field"] in {"address", "mailing_address", "municipality", "postal_code", "city"}]
+        claim("locations", "available" if location_facts else "not_available", location_facts)
         self.roles(org, env, claim)
         self.financials(org, env, claim)
         site = registry_fields["website"]

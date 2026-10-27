@@ -186,6 +186,37 @@ class AgentTests(unittest.TestCase):
         people = next(c for c in result["claims"] if c["family"] == "people")
         self.assertEqual(people["facts"][0]["value"]["name"], "Ada Nord")
 
+    def test_additional_official_registry_fields_have_identity_tied_evidence(self):
+        entity = {
+            "organisasjonsnummer": "923609016", "navn": "Eksempel AS",
+            "organisasjonsform": {"kode": "AS", "beskrivelse": "Aksjeselskap"},
+            "stiftelsesdato": "2018-05-03", "registreringsdatoForetaksregisteret": "2018-05-10",
+            "vedtektsfestetFormaal": ["Produksjon av utstyr", "og rådgivning."],
+            "institusjonellSektorkode": {"kode": "2100", "beskrivelse": "Private aksjeselskaper mv."},
+            "kapital": {"type": "Aksjekapital", "valuta": "NOK", "belop": 30000.0,
+                        "antallAksjer": 100, "innfortDato": "2018-05-03"},
+            "registrertIMvaregisteret": False, "sisteInnsendteAarsregnskap": "2025",
+            "epostadresse": "post@eksempel.no", "telefon": "12345678",
+            "postadresse": {"adresse": ["Postboks 1"], "postnummer": "0001", "poststed": "Oslo"},
+        }
+        payloads = [entity, {"rollegrupper": []}, []]
+        with patch.object(sp, "get_json", side_effect=[(item, json.dumps(item).encode(), 200) for item in payloads]):
+            result = self.agent.company("923609016")
+        self.assertEqual(result["operations"]["requests"], 3)
+        details = next(c for c in result["claims"] if c["family"] == "company_details")
+        by_field = {fact["field"]: fact for fact in details["facts"]}
+        self.assertEqual(by_field["incorporated_at"]["valid_at"], "2018-05-03")
+        self.assertEqual(by_field["stated_purpose"]["value"], "Produksjon av utstyr og rådgivning.")
+        self.assertEqual(by_field["share_capital_nok"]["value"], 30000.0)
+        self.assertEqual(by_field["share_capital_nok"]["valid_at"], "2018-05-03")
+        self.assertEqual(by_field["vat_registered"]["value"], False)
+        self.assertEqual(by_field["contact_email"]["value"], "post@eksempel.no")
+        self.assertEqual(by_field["latest_submitted_accounts_year"]["value"], "2025")
+        self.assertEqual(by_field["mailing_address"]["evidence_ids"], [result["identity_anchor"]["evidence_id"]])
+        locations = next(c for c in result["claims"] if c["family"] == "locations")
+        self.assertEqual(locations["status"], "available")
+        self.assertEqual([fact["field"] for fact in locations["facts"]], ["mailing_address"])
+
     def test_registry_plus_website_adds_only_exact_entity_facts(self):
         data = {"organisasjonsnummer":"923609016","navn":"Example AS","organisasjonsform":{"kode":"AS"},"hjemmeside":"https://example.no","naeringskode1":{"kode":"62.010","beskrivelse":"Software"}}
         roles = {"rollegrupper":[]}
